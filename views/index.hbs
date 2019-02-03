@@ -1,0 +1,38 @@
+<p>Some Quantification of Selves...</p>
+
+{{^user}}
+  <p><a href="/auth/google">Login/signup with Google</a></p>
+{{/user}}
+{{#user}}
+  {{#accounts.google.profile.photos}}
+    <img style="float: right; width: 2em" src="{{value}}" />
+  {{/accounts.google.profile.photos}}
+  <p>You are logged in as {{accounts.google.profile.displayName}}.</p>
+
+  <p>User ID: {{id}}</p>
+
+  {{^accounts.fitbit}}
+    <p><a href="/auth/fitbit">Connect Fitbit</a></p>
+  {{/accounts.fitbit}}
+
+  <!--
+  {{^accounts.runkeeper}}
+    <p><a href="/auth/runkeeper">Connect Runkeeper</a> to enable activity syncing.</p>
+  {{/accounts.runkeeper}}
+
+  {{#accounts.runkeeper}}
+    <ul>
+      <li><a href="/home">List fitbit activities</a></li>
+      <li><a href="/fitbit/listSubscriptions">Check Fitbit API Subscription</a></li>
+    </ul>
+  {{/accounts.runkeeper}} -->
+{{/user}}
+
+<h4>News / Changelog</h4>
+
+<dl>
+  <dt>2018-01-23</dt>
+  <dd>
+    Prototyping, again...
+  </dd>
+</dl>

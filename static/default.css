@@ -1,0 +1,24 @@
+body {
+  max-width: 55em;
+  margin: 0 auto;
+  padding: 1ex;
+}
+
+.legal_crap {
+  font-size:   60%;
+}
+
+.repo_info {
+  text-align:  right;
+  font-size:   60%;
+  font-family: sans-serif;
+}
+
+.repo_info a, h1 a {
+  text-decoration: none;
+  color: black;
+}
+
+dt {
+  font-weight: bold;
+}

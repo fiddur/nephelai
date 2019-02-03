@@ -1,0 +1,24 @@
+{
+  "name": "quantified-nephelai",
+  "version": "0.1.0",
+  "description": "Collect and aggregate your Quantified Self data",
+  "main": "web-server.js",
+  "author": "Fredrik Liljegren <fredrik@liljegren.org>",
+  "license": "AGPL-3.0-or-later",
+  "scripts" : { "start" : "node web-server.js" },
+  "dependencies": {
+    "cookie-session": "^2.0.0-beta.3",
+    "express": "^4.16.2",
+    "express-handlebars": "^3.0.0",
+    "googleapis": "^36.0.0",
+    "node-eventstore-client": "^0.2",
+    "passport": "^0.4.0",
+    "passport-fitbit-oauth2": "^1.0.2",
+    "passport-google-oauth20": "^1.0.0",
+    "passport-polar": "^1.0.1",
+    "request": "^2.83.0",
+    "request-promise": "^4.2.2",
+    "request-promise-native": "^1.0.5",
+    "uuid": "^3.2.1"
+  }
+}
