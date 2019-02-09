@@ -1,5 +1,5 @@
-Quantified Nephelai
-===================
+Nephelai - Self Quantification Aggregator
+=========================================
 
 The Νεφελαι were the Okeanid-nymphs of clouds and rain.
 
