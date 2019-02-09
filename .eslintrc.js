@@ -1,12 +1,10 @@
 module.exports = {
-  env: {
-    node: true
-  },
-  parserOptions: {
-    ecmaVersion: 8,
-  },
+  env: { node: true },
+  parserOptions: { ecmaVersion: 9 },
   'extends': 'airbnb',
   rules: {
+    'sort-keys': 'error',
+    'sort-imports': 'error',
     camelcase: 'off',
     'semi': ['error', 'never'],
     'no-reserved-keys': 0,
@@ -26,6 +24,12 @@ module.exports = {
         imports:   'always-multiline',
         exports:   'always-multiline',
         functions: 'ignore',
+    }],
+    'object-curly-newline': ['error', {
+      ObjectExpression:  { minProperties: 6, multiline: true, consistent: true },
+      ObjectPattern:     { minProperties: 6, multiline: true, consistent: true },
+      ImportDeclaration: { minProperties: 6, multiline: true, consistent: true },
+      ExportDeclaration: { minProperties: 6, multiline: true, consistent: true },
     }],
     'no-await-in-loop': 0,
     'no-restricted-syntax': 0,

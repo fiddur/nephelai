@@ -47,6 +47,16 @@ Setup and use
   * `ES_ENDPOINT`, `ES_USER`, `ES_PASSWORD` for EventStore server
 * `yarn`
 
+### Start web (for user creation and authorization)
+
+`yarn start`
+
+
+### Tasks (to eventually be triggered by cron or queue)
+
+* Heart Rate from Fitbit to GoogleFit: `node fitbit2google.js`
+* Heart Rate from Garmin to GoogleFit: `node garmin2google.js` (requires garmin user to be public)
+
 
 ### Caverats
 
@@ -58,3 +68,9 @@ Todo
 ----
 
 * Add EventStore docker setup script?
+* Add RunKeeper auth
+* Add Polar auth
+* Import runkeeper activity
+* Import polar sleep
+* Import garmin steps
+* Add input for garmin user id
