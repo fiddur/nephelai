@@ -341,18 +341,45 @@ const resolveAnnouncedNote = async (
   return attributionId == null ? null : { attributionId, note, uri: note.id.href }
 }
 
+/** The parts of an `Announce` a boost card is built from, once self-consistent. */
+interface ValidatedAnnounce {
+  actorId: URL
+  /** The `Announce`'s own id — the boost card's `object_uri`. */
+  announceUri: string
+  objectId: URL
+}
+
+/**
+ * The `Announce`'s own identity, or null when it can't back a boost card.
+ *
+ * Beyond the ids simply being present, the activity id must be **on the
+ * booster's host**: it becomes the card's `object_uri`, which is the GLOBAL
+ * upsert key, so it needs the same origin check `noteToTimelineInput` applies
+ * to a direct Note's id. Without it an accepted followee could announce a real
+ * third-party post under an id equal to another followee's existing entry and
+ * overwrite that entry with a boost card of their choosing (then evict it with
+ * an `Undo{Announce}`, since the row would name them as the booster). Mastodon
+ * mints `…/statuses/<n>/activity` on the actor's own host.
+ */
+const validateAnnounce = (announce: Announce): ValidatedAnnounce | null => {
+  const { actorId, id, objectId } = announce
+  if (actorId == null || id == null || objectId == null) return null
+  return id.host === actorId.host ? { actorId, announceUri: id.href, objectId } : null
+}
+
 /**
  * A followee boosted somebody else's post → a **boost card** in our timeline
  * (Mastodon's "🔄 X boosted"). The card is its own row keyed on the `Announce`
  * id, describing the ORIGINAL post and author, with the booster in
  * `boosted_by_*` — see `TimelineBoostSource`.
  *
- * Guards, in order: only an **accepted followee** can boost into our timeline;
- * the announced Note and its author are **fetched from their own ids**, never
- * taken from the activity body (see `resolveAnnouncedNote`); the Note must be on
- * the same host as the announced id and declare `attributedTo`; and a post
- * ALREADY in this timeline directly gets no boost card (Mastodon hides a reblog
- * of a post you have).
+ * Guards, in order: the `Announce` must be self-consistent (see
+ * `validateAnnounce` — its id is the card's upsert key); only an **accepted
+ * followee** can boost into our timeline; the announced Note and its author are
+ * **fetched from their own ids**, never taken from the activity body (see
+ * `resolveAnnouncedNote`); the Note must be on the same host as the announced id
+ * and declare `attributedTo`; and a post ALREADY in this timeline directly gets
+ * no boost card (Mastodon hides a reblog of a post you have).
  */
 const ingestBoostedNote = async (
   ctx: InboxContext<void>,
@@ -362,20 +389,19 @@ const ingestBoostedNote = async (
   enrich: (objectUri: string, token?: string) => Promise<FeedStructuredPost | null> = async () => null,
 ): Promise<void> => {
   const me = ctx.recipient
-  const objectId = announce.objectId
-  if (me == null || !isValidUsername(me) || announce.actorId == null) return
-  if (announce.id == null || objectId == null) return
+  const valid = validateAnnounce(announce)
+  if (me == null || !isValidUsername(me) || valid == null) return
   try {
-    const booster = await getFeedFollowingByActor(me, announce.actorId.href)
+    const booster = await getFeedFollowingByActor(me, valid.actorId.href)
     if (booster == null || !booster.accepted) return
-    const announced = await resolveAnnouncedNote(ctx, objectId)
+    const announced = await resolveAnnouncedNote(ctx, valid.objectId)
     if (announced == null) return
     if ((await getTimelineEntryByObjectUri(me, announced.uri)) != null) return
     const author = await resolveBoostAuthor(ctx, me, announced.attributionId)
     if (author == null) return
     await ingestNoteForRecipient(me, announced.note, author, enrich, onNewEntry, origin, {
       actor_uri: booster.actor_uri,
-      announce_uri: announce.id.href,
+      announce_uri: valid.announceUri,
       display_name: booster.display_name,
       handle: booster.handle,
       published_at: announce.published == null ? new Date() : temporalInstantToDate(announce.published),

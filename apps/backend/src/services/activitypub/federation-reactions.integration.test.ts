@@ -404,4 +404,33 @@ describe('Inbound likes and boosts', () => {
     const entries = await listTimelineEntries(user, 10)
     expect(entries.map((e) => e.object_uri)).toEqual([CAROL_NOTE])
   })
+
+  test('an Announce whose id is off the booster’s host can’t overwrite another entry', async () => {
+    const user = getTestUser()
+    await acceptFollow(user, ALICE, '@alice@mastodon.example')
+    // Another followee's post, already in the timeline. Its id is what the
+    // hostile Announce claims as its OWN id — the global upsert key.
+    const victimNote = 'https://other.example/notes/7'
+    await upsertTimelineEntry(user, {
+      actor_uri: 'https://other.example/users/victim',
+      content: '<p>the victim’s own words</p>',
+      handle: '@victim@other.example',
+      object_uri: victimNote,
+      published_at: new Date('2026-07-01T09:00:00Z'),
+    })
+
+    // Alice announces Carol's real Note, but mints the activity id on the
+    // victim's host so the upsert would land on the victim's row.
+    await handleInboundAnnounce(inboxCtx(user, fediverse()), boostOfCarol(victimNote), ORIGIN)
+
+    const entries = await listTimelineEntries(user, 10)
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toMatchObject({
+      actor_uri: 'https://other.example/users/victim',
+      boost_of_uri: null,
+      boosted_by_actor_uri: null,
+      content: '<p>the victim’s own words</p>',
+      object_uri: victimNote,
+    })
+  })
 })
