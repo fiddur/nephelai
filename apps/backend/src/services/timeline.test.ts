@@ -1,10 +1,10 @@
 import { describe, expect, test } from 'vitest'
 
-import type { TimelineCursor, TimelineEntryRecord } from '../db/index.ts'
+import type { TimelineCursor, TimelinePageRow } from '../db/index.ts'
 
 import { getTimelinePage, serializeTimelineEntry } from './timeline.ts'
 
-const record = (over: Partial<TimelineEntryRecord> = {}): TimelineEntryRecord => ({
+const record = (over: Partial<TimelinePageRow> = {}): TimelinePageRow => ({
   actor_uri: 'https://remote.example/users/alice',
   avatar_url: 'https://remote.example/avatars/alice.png',
   boost_of_uri: null,
@@ -12,6 +12,8 @@ const record = (over: Partial<TimelineEntryRecord> = {}): TimelineEntryRecord =>
   boosted_by_display_name: null,
   boosted_by_handle: null,
   content: '<p>Ran a 5k</p>',
+  // What the page query selects as `published_at::text` — the cursor position.
+  cursor_ts: '2026-07-01 08:00:00+00',
   display_name: 'Alice',
   handle: '@alice@remote.example',
   id: '00000000-0000-0000-0000-000000000001',
@@ -95,9 +97,10 @@ describe('serializeTimelineEntry', () => {
 })
 
 describe('getTimelinePage', () => {
-  const rows = (n: number): TimelineEntryRecord[] =>
+  const rows = (n: number): TimelinePageRow[] =>
     Array.from({ length: n }, (_, i) =>
       record({
+        cursor_ts: new Date(Date.UTC(2026, 6, 1, 8, 0, n - i)).toISOString(),
         id: `00000000-0000-0000-0000-00000000000${i}`,
         object_uri: `https://remote.example/notes/${i}`,
         published_at: new Date(Date.UTC(2026, 6, 1, 8, 0, n - i)), // newest first
@@ -202,11 +205,11 @@ describe('getTimelinePage', () => {
       fetchReactions: async () => [],
     })
     expect(received?.id).toBe(lastEntry.id)
-    expect(received?.published_at.toISOString()).toBe(lastEntry.published_at)
+    expect(received?.published_at).toBe(lastEntry.published_at)
   })
 
   test('treats a malformed cursor as the first page (undefined) rather than throwing', async () => {
-    let received: TimelineCursor | undefined = { id: 'sentinel', published_at: new Date(0) }
+    let received: TimelineCursor | undefined = { id: 'sentinel', published_at: '2026-01-01 00:00:00+00' }
     await getTimelinePage('user', 20, 'not-a-valid-cursor!!', {
       fetchEntries: async (_u, _l, cursor) => {
         received = cursor
@@ -221,7 +224,7 @@ describe('getTimelinePage', () => {
     // `12345:not-a-uuid` base64url-decodes with a safe-integer ms but a non-UUID id;
     // it must decode to undefined (first page) rather than reaching the uuid cast.
     const crafted = Buffer.from('12345:not-a-uuid').toString('base64url')
-    let received: TimelineCursor | undefined = { id: 'sentinel', published_at: new Date(0) }
+    let received: TimelineCursor | undefined = { id: 'sentinel', published_at: '2026-01-01 00:00:00+00' }
     await getTimelinePage('user', 20, crafted, {
       fetchEntries: async (_u, _l, cursor) => {
         received = cursor

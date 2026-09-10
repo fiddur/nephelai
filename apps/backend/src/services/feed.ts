@@ -22,6 +22,7 @@ import type { FeedPost } from '@aurboda/api-spec'
 import type {
   Activity,
   FeedPostCursor,
+  FeedPostPageRow,
   FeedPostReactionCount,
   FeedPostRecord,
   TimelineReplyCount,
@@ -238,7 +239,7 @@ export type FeedPostsFetcher = (
   user: string,
   limit: number,
   before?: FeedPostCursor,
-) => Promise<FeedPostRecord[]>
+) => Promise<FeedPostPageRow[]>
 
 /** Batched like/boost tallies for a page of posts — the second DB dependency of `getFeedPage`. */
 export type FeedReactionCountsFetcher = (user: string, postIds: string[]) => Promise<FeedPostReactionCount[]>
@@ -303,11 +304,9 @@ export const getFeedPage = async (
   const page = hasMore ? rows.slice(0, limit) : rows
   const last = page[page.length - 1]
   const posts = await Promise.all(page.map((record) => serializeFeedPost(user, record, opts)))
-  // Only the LISTING carries reaction + reply counts (one batched query each per
-  // page); single-post responses leave them absent.
   const counted = await withReactionCounts(user, posts, fetchReactionCounts)
   return {
-    next_cursor: hasMore && last ? encodeKeysetCursor(last.created_at, last.id) : null,
+    next_cursor: hasMore && last ? encodeKeysetCursor(last.cursor_ts, last.id) : null,
     posts:
       opts.origin == null ? counted : await withReplyCounts(user, opts.origin, counted, fetchReplyCounts),
   }

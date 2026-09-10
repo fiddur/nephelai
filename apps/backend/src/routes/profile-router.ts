@@ -68,8 +68,9 @@ export const createProfileRouter = (
   )
 
   router.delete<Record<string, never>, { success: boolean }>('/avatar', authMiddleware, async (req, res) => {
-    await deleteProfileAvatar(req.user!)
-    onAvatarChanged?.(req.user!)
+    // Only a delete that removed something changes the actor document, so a
+    // repeat DELETE doesn't fan an `Update{Person}` out to every follower.
+    if (await deleteProfileAvatar(req.user!)) onAvatarChanged?.(req.user!)
     res.json({ success: true })
   })
 

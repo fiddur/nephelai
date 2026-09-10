@@ -6,7 +6,12 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
 
 import { cleanTestDb, getTestUser, startTestDb, stopTestDb } from '../test/db-test-helper.ts'
-import { deleteProfileAvatar, getProfileAvatar, upsertProfileAvatar } from './profile-avatar.ts'
+import {
+  deleteProfileAvatar,
+  getProfileAvatar,
+  getProfileAvatarVersion,
+  upsertProfileAvatar,
+} from './profile-avatar.ts'
 
 const CONTAINER_TIMEOUT = 120_000
 
@@ -46,6 +51,21 @@ describe('Profile avatar integration', () => {
     const stored = await getProfileAvatar(user)
     expect(stored?.content_type).toBe('image/png')
     expect(stored?.data.equals(Buffer.from([9, 9]))).toBe(true)
+  })
+
+  test('getProfileAvatarVersion reports the upload time without the bytes (#1049)', async () => {
+    const user = getTestUser()
+    // No row: the identicon fallback, which needs no cache-busting version.
+    expect(await getProfileAvatarVersion(user)).toBeUndefined()
+
+    await upsertProfileAvatar(user, 'image/webp', Buffer.from([1]))
+    const stored = await getProfileAvatar(user)
+    expect((await getProfileAvatarVersion(user))?.getTime()).toBe(stored?.updated_at.getTime())
+
+    // A replacement moves it, which is what changes the actor's icon URL.
+    await upsertProfileAvatar(user, 'image/png', Buffer.from([9, 9]))
+    const replaced = await getProfileAvatar(user)
+    expect((await getProfileAvatarVersion(user))?.getTime()).toBe(replaced?.updated_at.getTime())
   })
 
   test('deletes the avatar and reports whether a row was removed', async () => {

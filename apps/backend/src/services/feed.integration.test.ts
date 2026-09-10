@@ -7,6 +7,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
  * (`resolveActivityWindow` → `getOverlappingActivities`) actually runs.
  */
 import { deleteActivity, insertActivity } from '../db/activities/index.ts'
+import { query } from '../db/connection.ts'
 import { createFeedPost, type FeedPostInput } from '../db/feed.ts'
 import { insertLocations } from '../db/locations.ts'
 import { insertTimeSeries } from '../db/time-series.ts'
@@ -259,7 +260,7 @@ describe('feed service', () => {
       expect(page2.next_cursor).toBeNull()
     })
 
-    test('an exactly-full page ends with a cursor whose next page is empty and final', async () => {
+    test('an exactly-full page carries no cursor (nothing follows it)', async () => {
       const user = getTestUser()
       await createFeedPost(user, postInput(null))
       await createFeedPost(user, postInput(null))
@@ -268,6 +269,26 @@ describe('feed service', () => {
       expect(page1.posts).toHaveLength(2)
       // 2 rows for limit 2: no extra row was fetched, so no next page.
       expect(page1.next_cursor).toBeNull()
+    })
+
+    test('walks past posts sharing a millisecond instead of dropping one (#1025)', async () => {
+      const user = getTestUser()
+      const a = await createFeedPost(user, postInput(null))
+      const b = await createFeedPost(user, postInput(null))
+      await query(user, 'UPDATE feed_posts SET created_at = $1::timestamptz WHERE id = $2', [
+        '2026-08-20 09:00:00.500700+00',
+        a.id,
+      ])
+      await query(user, 'UPDATE feed_posts SET created_at = $1::timestamptz WHERE id = $2', [
+        '2026-08-20 09:00:00.500200+00',
+        b.id,
+      ])
+
+      const page1 = await getFeedPage(user, 1, undefined)
+      expect(page1.posts.map((p) => p.id)).toEqual([a.id])
+      const page2 = await getFeedPage(user, 1, page1.next_cursor ?? undefined)
+      // With a ms-truncated cursor `b` fell into the gap and no page ever showed it.
+      expect(page2.posts.map((p) => p.id)).toEqual([b.id])
     })
 
     test('a malformed cursor falls back to the first page (never a 500)', async () => {

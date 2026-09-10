@@ -13,6 +13,8 @@ import {
   deleteTimelineEntryByUri,
   getTimelineEntryById,
   getTimelineEntryByObjectUri,
+  hasCachedActorPresentation,
+  isTimelineEntryVisible,
   listReplyUncheckedEntries,
   listTimelineEntries,
   listTimelineRepliesTo,
@@ -39,6 +41,10 @@ const entry = (n: number, overrides: Partial<TimelineEntryInput> = {}): Timeline
   url: `https://mastodon.example/@alice/${n}`,
   ...overrides,
 })
+
+/** Pin an entry's `published_at` to an exact µs-precision instant (the keyset key). */
+const setPublishedAt = (user: string, id: string, ts: string): Promise<unknown> =>
+  query(user, 'UPDATE timeline_entry SET published_at = $1::timestamptz WHERE id = $2', [ts, id])
 
 describe('Timeline store integration', () => {
   beforeAll(async () => {
@@ -162,37 +168,58 @@ describe('Timeline store integration', () => {
     ])
 
     const last = page1[page1.length - 1]
-    const page2 = await listTimelineEntries(user, 2, { id: last.id, published_at: last.published_at })
+    const page2 = await listTimelineEntries(user, 2, { id: last.id, published_at: last.cursor_ts })
     expect(page2.map((e) => e.object_uri)).toEqual([
       'https://mastodon.example/notes/3',
       'https://mastodon.example/notes/2',
     ])
 
     const last2 = page2[page2.length - 1]
-    const page3 = await listTimelineEntries(user, 2, { id: last2.id, published_at: last2.published_at })
+    const page3 = await listTimelineEntries(user, 2, { id: last2.id, published_at: last2.cursor_ts })
     expect(page3.map((e) => e.object_uri)).toEqual(['https://mastodon.example/notes/1'])
   })
 
-  test('stores in_reply_to_uri and filters replies-to-others per the reply filter (#1060)', async () => {
+  test('pages losslessly across entries sharing a millisecond (#1025)', async () => {
+    const user = getTestUser()
+    const a = await upsertTimelineEntry(user, entry(1))
+    const b = await upsertTimelineEntry(user, entry(2))
+    // Same millisecond, different microsecond — `pg` parses both to the same JS
+    // Date, so a cursor built from one would skip the other on the next page.
+    await setPublishedAt(user, a.id, '2026-08-20 09:00:00.500700+00')
+    await setPublishedAt(user, b.id, '2026-08-20 09:00:00.500200+00')
+
+    const page1 = await listTimelineEntries(user, 1)
+    expect(page1.map((e) => e.id)).toEqual([a.id])
+    expect(page1[0].cursor_ts).toContain('.5007')
+
+    const page2 = await listTimelineEntries(user, 1, { id: page1[0].id, published_at: page1[0].cursor_ts })
+    expect(page2.map((e) => e.id)).toEqual([b.id])
+  })
+
+  test('stores in_reply_to_uri and hides only replies to posts outside the timeline (#1062)', async () => {
     const user = getTestUser()
     const ownPrefix = `https://aurboda.example/users/${user}/feed/`
     await upsertTimelineEntry(user, entry(1)) // top-level post
+    // A reply to a post the timeline already holds — a thread the reader can
+    // follow, so it shows (as it does on Mastodon's home).
     await upsertTimelineEntry(user, entry(2, { in_reply_to_uri: 'https://mastodon.example/notes/1' }))
     const replyToMine = await upsertTimelineEntry(
       user,
       entry(3, { in_reply_to_uri: `${ownPrefix}11111111-1111-4111-8111-111111111111` }),
     )
     expect(replyToMine.in_reply_to_uri).toBe(`${ownPrefix}11111111-1111-4111-8111-111111111111`)
+    // A reply to a post NOBODY here has — half a conversation, so it is hidden.
+    await upsertTimelineEntry(user, entry(4, { in_reply_to_uri: 'https://elsewhere.example/notes/999' }))
 
     // No filter (legacy callers): everything.
-    expect(await listTimelineEntries(user, 10)).toHaveLength(3)
-    // show_replies=false: top-level + the reply to the reader's own post only.
+    expect(await listTimelineEntries(user, 10)).toHaveLength(4)
     const filtered = await listTimelineEntries(user, 10, undefined, {
       own_object_prefix: ownPrefix,
       show_replies: false,
     })
     expect(filtered.map((r) => r.object_uri)).toEqual([
       'https://mastodon.example/notes/3',
+      'https://mastodon.example/notes/2',
       'https://mastodon.example/notes/1',
     ])
     // show_replies=true: everything again.
@@ -200,7 +227,37 @@ describe('Timeline store integration', () => {
       own_object_prefix: ownPrefix,
       show_replies: true,
     })
-    expect(all).toHaveLength(3)
+    expect(all).toHaveLength(4)
+  })
+
+  test('isTimelineEntryVisible answers for one row exactly as the page does (#1062)', async () => {
+    const user = getTestUser()
+    const ownPrefix = `https://aurboda.example/users/${user}/feed/`
+    const hidden = await upsertTimelineEntry(
+      user,
+      entry(1, { in_reply_to_uri: 'https://elsewhere.example/notes/999' }),
+    )
+    const involved = await upsertTimelineEntry(
+      user,
+      entry(2, { in_reply_to_uri: `${ownPrefix}11111111-1111-4111-8111-111111111111` }),
+    )
+    const hiding = { own_object_prefix: ownPrefix, show_replies: false }
+
+    expect(await isTimelineEntryVisible(user, hidden.id, hiding)).toBe(false)
+    expect(await isTimelineEntryVisible(user, involved.id, hiding)).toBe(true)
+    // With the setting on nothing is filtered — not even a row that is gone.
+    expect(await isTimelineEntryVisible(user, hidden.id, { ...hiding, show_replies: true })).toBe(true)
+  })
+
+  test('hasCachedActorPresentation gates the inbound Update{Person} refresh (#1111)', async () => {
+    const user = getTestUser()
+    const alice = 'https://mastodon.example/users/alice'
+    expect(await hasCachedActorPresentation(user, alice)).toBe(false)
+
+    // A post of theirs in the timeline is a cached copy of them, follow or not.
+    await upsertTimelineEntry(user, entry(1))
+    expect(await hasCachedActorPresentation(user, alice)).toBe(true)
+    expect(await hasCachedActorPresentation(user, 'https://evil.example/users/mallory')).toBe(false)
   })
 
   test('a BOOST of a reply stays visible with replies hidden (#1105)', async () => {
@@ -488,7 +545,7 @@ describe('Timeline store integration', () => {
           display_name: 'Bob Renamed',
           handle: '@bob@remote.example',
         }),
-      ).toBe(1)
+      ).toEqual({ authors: 0, boosters: 1 })
       const afterBob = await listTimelineEntries(user, 10)
       expect(afterBob.find((e) => e.object_uri === ANNOUNCE)?.boosted_by_display_name).toBe('Bob Renamed')
       expect(afterBob.map((e) => e.display_name)).toEqual(['Alice', 'Alice'])
@@ -501,7 +558,7 @@ describe('Timeline store integration', () => {
           display_name: 'Alice Renamed',
           handle: '@alice@mastodon.example',
         }),
-      ).toBe(2)
+      ).toEqual({ authors: 2, boosters: 0 })
       const afterAlice = await listTimelineEntries(user, 10)
       expect(afterAlice.map((e) => e.display_name)).toEqual(['Alice Renamed', 'Alice Renamed'])
       expect(afterAlice.find((e) => e.object_uri === ANNOUNCE)?.boosted_by_display_name).toBe('Bob Renamed')

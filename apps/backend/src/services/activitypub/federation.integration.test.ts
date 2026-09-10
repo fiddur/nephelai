@@ -3,7 +3,7 @@
  * `federation.fetch` against a real per-user database (no Express/nginx needed).
  */
 import { integrateFederation } from '@fedify/express'
-import { Create, Follow, Note, Person, Update } from '@fedify/fedify/vocab'
+import { Create, Follow, Mention, Note, Person, Update } from '@fedify/fedify/vocab'
 import express from 'express'
 import supertest from 'supertest'
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
@@ -27,6 +27,7 @@ import {
 import { getProfileAvatarVersion, upsertProfileAvatar } from '../../db/profile-avatar.ts'
 import { upsertUserSettings } from '../../db/settings.ts'
 import { listTimelineEntries, upsertTimelineEntry } from '../../db/timeline.ts'
+import { createActorHtmlRouter } from '../../routes/actor-html-router.ts'
 import { createFeedTombstoneRouter } from '../../routes/feed-tombstone-router.ts'
 import { cleanTestDb, getTestUser, startTestDb, stopTestDb } from '../../test/db-test-helper.ts'
 import { actorDocument, inboxContext } from '../../test/inbox-context.ts'
@@ -123,8 +124,16 @@ describe('Feed federation actor + WebFinger', () => {
     const after = await fetchAs2(`/users/${user}`)
     const afterDoc = (await after.json()) as { icon: { url: string } }
     // Remote servers re-download an avatar only when its URL changes, so the
-    // upload MUST change the URL (and each re-upload changes it again).
+    // upload MUST change the URL.
     expect(afterDoc.icon.url).toBe(`${ORIGIN}/u/${user}/avatar.png?v=${version?.getTime()}`)
+
+    // …and so must every re-upload after it. The version is `updated_at` at
+    // millisecond resolution in the URL, so pause past that before re-uploading.
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    await upsertProfileAvatar(user, 'image/png', Buffer.from('img2'))
+    const reuploaded = await fetchAs2(`/users/${user}`)
+    const reuploadedDoc = (await reuploaded.json()) as { icon: { url: string } }
+    expect(reuploadedDoc.icon.url).not.toBe(afterDoc.icon.url)
   })
 
   test('buildActorPerson (the Update{Person} payload) matches the served actor document', async () => {
@@ -574,6 +583,50 @@ describe('Feed federation actor + WebFinger', () => {
   const getObject = (app: express.Express, path: string) =>
     supertest(app).get(path).set('Accept', 'application/activity+json')
 
+  /**
+   * The actor-URL negotiation end to end (#1051): Fedify answers the request
+   * first and only next()s what it won't serve, so the HTML fallback's reach is
+   * only observable through the same mount order production uses.
+   */
+  const buildActorApp = (users: string[]) => {
+    const app = express()
+    app.set('trust proxy', 'loopback')
+    app.use(integrateFederation(fed, () => undefined))
+    app.use(
+      createActorHtmlRouter({
+        origin: ORIGIN,
+        userExists: async (username) => users.includes(username),
+      }),
+    )
+    return app
+  }
+
+  test('a browser navigation to an actor URL redirects to the profile page', async () => {
+    const user = getTestUser()
+    const res = await supertest(buildActorApp([user]))
+      .get(`/users/${user}`)
+      .set('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8')
+    expect(res.status).toBe(302)
+    expect(res.headers.location).toBe(`${ORIGIN}/u/${user}`)
+  })
+
+  test('a wildcard Accept on an actor URL is not redirected to HTML', async () => {
+    const user = getTestUser()
+    const res = await supertest(buildActorApp([user]))
+      .get(`/users/${user}`)
+      .set('Accept', '*/*')
+    // Whatever Fedify decides for a non-negotiating client (a 406 today), it is
+    // never our HTML redirect.
+    expect(res.status).not.toBe(302)
+  })
+
+  test('a browser navigation to an UNKNOWN actor is not redirected either', async () => {
+    const res = await supertest(buildActorApp([getTestUser()]))
+      .get('/users/nosuchuser')
+      .set('Accept', 'text/html')
+    expect(res.status).not.toBe(302)
+  })
+
   test('serves a 410 Tombstone after a public post is deleted (Fedify falls through)', async () => {
     const user = getTestUser()
     const activityId = await insertExercise(user)
@@ -724,6 +777,100 @@ describe('Feed federation actor + WebFinger', () => {
       // show WHO replied.
       await handleInboundCreate(inboxContext(fed, ORIGIN, user), replyToOwnPost(target), ORIGIN)
       expect(await listTimelineEntries(user, 10)).toHaveLength(0)
+    })
+
+    /** A stranger's Note that only MENTIONS the owner (no reply target). */
+    const mentioning = (actorUri: string) =>
+      new Create({
+        actor: forgedAlice(),
+        id: new URL(`${ALICE}/statuses/7/activity`),
+        object: new Note({
+          attribution: new URL(ALICE),
+          content: '<p>hi there</p>',
+          id: new URL(`${ALICE}/statuses/7`),
+          published: dateToTemporalInstant(new Date('2026-07-02T09:00:00Z')),
+          tags: [new Mention({ href: new URL(actorUri), name: '@someone' })],
+        }),
+      })
+
+    test('a stranger’s Mention of the owner is admitted', async () => {
+      const user = getTestUser()
+      await handleInboundCreate(
+        inboxContext(fed, ORIGIN, user, aliceServes()),
+        mentioning(`${ORIGIN}/users/${user}`),
+        ORIGIN,
+      )
+      const entries = await listTimelineEntries(user, 10)
+      expect(entries).toHaveLength(1)
+      expect(entries[0].mentions_me).toBe(true)
+    })
+
+    test('a stranger’s Mention of SOMEBODY ELSE is dropped (no involvement)', async () => {
+      const user = getTestUser()
+      await handleInboundCreate(
+        inboxContext(fed, ORIGIN, user, aliceServes()),
+        mentioning('https://mastodon.example/users/bob'),
+        ORIGIN,
+      )
+      expect(await listTimelineEntries(user, 10)).toHaveLength(0)
+    })
+
+    test('an involved stranger Note with no attributedTo is dropped before the actor fetch', async () => {
+      const user = getTestUser()
+      const target = await ownPostUri(user)
+      // Same-host + signed, but claiming no author: the #1018 authority check.
+      const unattributed = new Create({
+        actor: forgedAlice(),
+        id: new URL(`${ALICE}/statuses/8/activity`),
+        object: new Note({
+          content: '<p>Nice run!</p>',
+          id: new URL(`${ALICE}/statuses/8`),
+          published: dateToTemporalInstant(new Date('2026-07-02T09:00:00Z')),
+          replyTarget: new URL(target),
+        }),
+      })
+      await handleInboundCreate(inboxContext(fed, ORIGIN, user, aliceServes()), unattributed, ORIGIN)
+      expect(await listTimelineEntries(user, 10)).toHaveLength(0)
+    })
+
+    test('the live “new post” ping is skipped for a reply the reader has hidden (#1062)', async () => {
+      const user = getTestUser()
+      // A followee's reply to a post nobody here holds: stored, but not shown
+      // under the default setting — so it must not ping either.
+      await upsertFeedFollowing(user, {
+        actor_uri: ALICE,
+        display_name: 'Alice',
+        handle: '@alice@mastodon.example',
+        inbox_uri: `${ALICE}/inbox`,
+      })
+      await markFeedFollowingAccepted(user, ALICE)
+      const pinged: string[] = []
+      await handleInboundCreate(
+        inboxContext(fed, ORIGIN, user, aliceServes()),
+        replyToOwnPost('https://elsewhere.example/notes/999'),
+        ORIGIN,
+        (recipient) => pinged.push(recipient),
+      )
+      expect(await listTimelineEntries(user, 10)).toHaveLength(1)
+      expect(pinged).toEqual([])
+
+      // A top-level post from the same followee does ping.
+      await handleInboundCreate(
+        inboxContext(fed, ORIGIN, user, aliceServes()),
+        new Create({
+          actor: forgedAlice(),
+          id: new URL(`${ALICE}/statuses/9/activity`),
+          object: new Note({
+            attribution: new URL(ALICE),
+            content: '<p>Ran a 5k</p>',
+            id: new URL(`${ALICE}/statuses/9`),
+            published: dateToTemporalInstant(new Date('2026-07-02T10:00:00Z')),
+          }),
+        }),
+        ORIGIN,
+        (recipient) => pinged.push(recipient),
+      )
+      expect(pinged).toEqual([user])
     })
 
     /** Every cached copy of Alice: as followee, follower, post author and booster. */

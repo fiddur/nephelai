@@ -136,6 +136,7 @@ import {
   type RetroEnrichTrigger,
   retroEnrichTimelineEntries,
 } from './services/timeline-retro-enrich.ts'
+import { ownActorUri } from './services/timeline.ts'
 import { createWebAuthnService } from './services/webauthn.ts'
 
 /** Grace period for in-flight requests before sockets are forced closed. */
@@ -432,7 +433,7 @@ const main = async () => {
     // Reply/Mention backfill for entries ingested before #1060 tracked them —
     // re-fetches a few objects per read so legacy replies stop rendering as
     // top-level cards.
-    const replyPass = backfillReplyLinks(user, `${webHost.replace(/\/+$/, '')}/users/${user}`, {
+    const replyPass = backfillReplyLinks(user, ownActorUri(webHost, user), {
       fetchObject: async (objectUri) =>
         (
           await safeFetchGet(objectUri, {
@@ -511,10 +512,12 @@ const main = async () => {
     },
     // A reply federates like a challenge share — a self-contained Note — but
     // additionally to the inbox of the author it answers, who need not follow us.
-    createdReply: (user, post) => {
+    createdReply: (user, post, authorInbox) => {
       const reply = toDeliverableReply(post)
       if (reply) {
-        void deliverFeedReplyPost(feedDeps, user, reply).catch(onDeliverError('create', user, post.id))
+        void deliverFeedReplyPost(feedDeps, user, reply, authorInbox).catch(
+          onDeliverError('create', user, post.id),
+        )
       }
     },
     updatedReply: (user, post) => {
@@ -614,8 +617,6 @@ const main = async () => {
     follow: (user, handle) => followActor(feedDeps, user, handle),
     unfollow: (user, id) => unfollowActor(feedDeps, user, id),
   }
-  // Outbound likes ⭐ / boosts 🔄 on the home timeline, on the same federation +
-  // origin, shared by the REST feed router and the MCP reaction tools.
   const reactionActions = createReactionActions(feedDeps, feedDeliver)
   // The follower-management operations (approve/reject a follow request), sharing
   // the same federation + origin. Approve returns the serialised follower.
@@ -678,7 +679,14 @@ const main = async () => {
 
   // Browser-facing actor URLs (#1047): Fedify answers 406 to `Accept: text/html`
   // via the same next() fall-through, and this redirects humans to /u/:username.
-  httpd.use(createActorHtmlRouter({ origin: webHost }))
+  // An account is one with a per-user database — the same existence test the
+  // background sweeps use — so an unknown actor keeps its 404 (#1051).
+  httpd.use(
+    createActorHtmlRouter({
+      origin: webHost,
+      userExists: async (username) => (await listUserNames(userDb)).includes(username),
+    }),
+  )
 
   httpd.use(json({ limit: '10mb' }))
 

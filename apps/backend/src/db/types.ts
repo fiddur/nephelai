@@ -513,7 +513,7 @@ export interface UserSettings {
   manually_approve_followers?: boolean // Hold incoming follows for manual approval (locked account)
   rescue_time_key?: string // RescueTime API key (personal token)
   sex?: BiologicalSex // Biological sex for calorie calculation
-  timeline_show_replies?: boolean // Show followed actors' replies to others as own timeline cards
+  timeline_show_replies?: boolean // Show followed actors' replies to posts outside your timeline as own cards
   item_icons?: Record<string, string> // Unified icon mappings for all timeline items (tags, activities, exercise types)
   tag_icons?: Record<string, string> // Deprecated: tag-only icons (migrated to item_icons)
   food_sensitivity_map?: Record<string, string[]> // Food item name -> sensitivity areas

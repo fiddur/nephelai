@@ -514,6 +514,18 @@ export const toDeliverableChallenge = (post: FeedPostRecord): DeliverableChallen
 export interface MentionRecipient {
   actorUri: URL
   handle: string
+  /**
+   * The actor's inbox, when the caller already resolved it (the reply path
+   * checks reachability before writing the post, #1108) — delivery then skips
+   * its own `lookupObject` round-trip for the same actor.
+   */
+  inbox?: ResolvedInbox
+}
+
+/** An already-resolved actor inbox, as cached on a followee row or freshly looked up. */
+export interface ResolvedInbox {
+  inbox_uri: string
+  shared_inbox_uri: string | null
 }
 
 /**
@@ -606,6 +618,13 @@ export const buildChallengeNoteUpdate = (
   })
 }
 
+/** The Fedify recipient for an already-resolved inbox (no actor document needed). */
+const inboxRecipient = (actorUri: URL, inbox: ResolvedInbox) => ({
+  endpoints: inbox.shared_inbox_uri ? { sharedInbox: new URL(inbox.shared_inbox_uri) } : null,
+  id: actorUri,
+  inboxId: new URL(inbox.inbox_uri),
+})
+
 /**
  * Deliver an activity to each mentioned actor's own inbox (besides the
  * followers fan-out), so someone who doesn't follow us is still told: a
@@ -617,7 +636,8 @@ export const buildChallengeNoteUpdate = (
  *
  * The actor is dereferenced by its id (`lookupObject`) rather than read off
  * anything inline, so the inbox we POST to is the one that id's own server
- * publishes.
+ * publishes — unless the caller already resolved that same inbox and passed it
+ * along, which is the identical answer without the second round-trip.
  */
 const deliverToMentioned = async (
   ctx: Context<void>,
@@ -629,14 +649,18 @@ const deliverToMentioned = async (
   for (const mention of mentions) {
     if (mention.actorUri.href === self) continue
     try {
-      const actor = await ctx.lookupObject(mention.actorUri)
-      if (!isActor(actor)) {
+      const recipient = mention.inbox == null ? await ctx.lookupObject(mention.actorUri) : mention.inbox
+      if (recipient != null && 'inbox_uri' in recipient) {
+        await ctx.sendActivity({ identifier: user }, inboxRecipient(mention.actorUri, recipient), activity)
+        continue
+      }
+      if (!isActor(recipient)) {
         // `lookupObject` yields null (not an error) when the actor document can't
         // be loaded.
         console.warn(`⚠️ Mention delivery to ${mention.handle} skipped: actor not resolvable`)
         continue
       }
-      await ctx.sendActivity({ identifier: user }, actor, activity)
+      await ctx.sendActivity({ identifier: user }, recipient, activity)
     } catch (error) {
       console.warn(`⚠️ Mention delivery to ${mention.handle} failed:`, error)
     }
@@ -730,6 +754,8 @@ export const toDeliverableReply = (post: FeedPostRecord): DeliverableReply | nul
  */
 export const replyMentions = (
   post: Pick<ReplyContentSource, 'in_reply_to_actor_uri' | 'in_reply_to_handle'>,
+  /** The author's inbox, already resolved by the reply handler (#1108). */
+  inbox?: ResolvedInbox,
 ): MentionRecipient[] => {
   if (post.in_reply_to_actor_uri == null) return []
   let actorUri: URL
@@ -738,7 +764,7 @@ export const replyMentions = (
   } catch {
     return []
   }
-  return [{ actorUri, handle: replyMentionName({ ...post, message: null }) }]
+  return [{ actorUri, handle: replyMentionName({ ...post, message: null }), ...(inbox && { inbox }) }]
 }
 
 /**
@@ -805,15 +831,21 @@ export const buildReplyNoteUpdate = (ctx: Context<void>, user: string, post: Del
   })
 }
 
-/** Build and send the `Create{Note}` for a fresh reply to followers and the answered author. */
+/**
+ * Build and send the `Create{Note}` for a fresh reply to followers and the
+ * answered author. `authorInbox` is the inbox the reply handler already resolved
+ * as its reachability gate (#1108) — passing it here spends that answer instead
+ * of looking the same actor up again.
+ */
 export const deliverFeedReplyPost = async (
   deps: FeedDeliveryDeps,
   user: string,
   post: DeliverableReply,
+  authorInbox?: ResolvedInbox,
 ): Promise<void> => {
   const ctx = await deps.federation.createContext(new URL(deps.origin))
   const create = buildReplyNoteCreate(ctx, user, post)
-  await sendToFollowersAndMentioned(ctx, user, replyMentions(post), create)
+  await sendToFollowersAndMentioned(ctx, user, replyMentions(post, authorInbox), create)
 }
 
 /** Build and send the `Update{Note}` for an edited reply to followers and the answered author. */

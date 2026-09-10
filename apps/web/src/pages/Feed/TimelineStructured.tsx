@@ -50,6 +50,11 @@ function ActivityStructured({ structured }: { structured: FeedStructuredActivity
             start={new Date(structured.start_time)}
             end={new Date(structured.end_time)}
             onHoverTime={setHoverTime}
+            // Axis priority goes to the LAST metrics in toggle order, so without
+            // a default the card's axes fall to whatever the payload happens to
+            // end with and heart rate — the most-shared series — loses its own
+            // (#1017). The activity detail view pins it the same way.
+            defaultMetrics={['heart_rate']}
           />
         </div>
       )}

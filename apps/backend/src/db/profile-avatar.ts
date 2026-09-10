@@ -26,11 +26,9 @@ export const getProfileAvatar = async (user: string): Promise<ProfileAvatar | un
 }
 
 /**
- * The avatar's last-modified time WITHOUT loading the image bytes — the actor
- * document embeds it as a cache-busting `?v=` on the icon URL (a remote server
- * only re-downloads an avatar when the URL changes), so this runs on every
- * actor fetch. `undefined` = no uploaded avatar (identicon fallback, which is
- * deterministic and needs no version).
+ * The avatar's last-modified time WITHOUT loading the image bytes — it versions
+ * the actor document's icon URL, and runs on every actor fetch. `undefined` = no
+ * uploaded avatar (the identicon fallback).
  */
 export const getProfileAvatarVersion = async (user: string): Promise<Date | undefined> => {
   const result = await query(user, `SELECT updated_at FROM profile_avatar WHERE singleton`)

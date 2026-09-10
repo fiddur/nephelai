@@ -380,7 +380,8 @@ export const serializeFeedPostReaction = (record: FeedPostReactionRecord): FeedP
  *
  * The author's inbox is resolved BEFORE the row is written (cached followee row
  * first, else a bounded actor lookup): a reply we can't address is a 502, so no
- * post is left claiming to answer someone who was never told.
+ * post is left claiming to answer someone who was never told. That resolved
+ * inbox is handed to the delivery hook, which would otherwise resolve it again.
  */
 const reply = async (
   deps: ReactionDeps,
@@ -393,7 +394,8 @@ const reply = async (
   if (entry == null) return { error: 'Timeline entry not found', ok: false, status: 404 }
   const message = body.message.trim()
   if (message === '') return { error: 'A reply needs some text.', ok: false, status: 400 }
-  if ((await resolveAuthorInbox(deps, user, entry.actor_uri)) == null) {
+  const authorInbox = await resolveAuthorInbox(deps, user, entry.actor_uri)
+  if (authorInbox == null) {
     return { error: 'Couldn’t reach the author’s server. Please try again later.', ok: false, status: 502 }
   }
   const record = await createReplyPost(user, {
@@ -405,7 +407,9 @@ const reply = async (
     message,
     visibility: body.visibility,
   })
-  deliver?.createdReply(user, record)
+  // The delivery reuses the inbox resolved above instead of looking the same
+  // actor up again (#1108).
+  deliver?.createdReply(user, record, authorInbox)
   return { ok: true, post: await serializeFeedPost(user, record) }
 }
 

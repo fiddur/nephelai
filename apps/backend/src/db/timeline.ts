@@ -55,7 +55,6 @@ export interface TimelineEntryInput {
   content: string
   url?: string | null
   published_at: Date
-  /** The `inReplyTo` object id when the post is a reply. */
   in_reply_to_uri?: string | null
   /** Whether the post carries a Mention tag for the timeline owner. */
   mentions_me?: boolean
@@ -72,8 +71,20 @@ export interface TimelineEntryInput {
 
 /** Opaque keyset cursor: the last row's `(published_at, id)`. */
 export interface TimelineCursor {
-  published_at: Date
+  /** `published_at` as Postgres text (µs precision) — see `cursor_ts`. */
+  published_at: string
   id: string
+}
+
+/**
+ * A listing row plus the exact keyset position it sits at: `published_at`
+ * rendered by Postgres itself, at the microsecond precision the page predicate
+ * compares at. `pg` parses `timestamptz` into a ms-only JS `Date`, so the
+ * record's own `published_at` cannot address a row inside its millisecond
+ * (#1025). Cursor use only — never serialised onto a DTO.
+ */
+export interface TimelinePageRow extends TimelineEntryRecord {
+  cursor_ts: string
 }
 
 const TIMELINE_COLUMNS =
@@ -191,16 +202,19 @@ export const refreshBoostedCopies = async (
 /**
  * Refresh a remote actor's cached presentation on every timeline row that shows
  * them — as a post's AUTHOR and as the BOOSTER of a boost card — after an
- * inbound `Update{Person}` (#1057). Returns how many rows changed. Only
- * presentation columns move: which post a row is, and who delivered it, are
- * untouched. The booster line carries no avatar, so only the two text columns
- * exist to refresh there.
+ * inbound `Update{Person}` (#1057). Only presentation columns move: which post a
+ * row is, and who delivered it, are untouched. The booster line carries no
+ * avatar, so only the two text columns exist to refresh there.
+ *
+ * The two counts stay separate: one row can be refreshed on both statements (a
+ * self-boost card, authored and boosted by the same actor), so their sum is not
+ * a row count.
  */
 export const updateTimelineActorPresentation = async (
   user: string,
   actorUri: string,
   presentation: CachedActorPresentation,
-): Promise<number> => {
+): Promise<{ authors: number; boosters: number }> => {
   const author = await query(
     user,
     `UPDATE timeline_entry SET handle = $2, display_name = $3, avatar_url = $4
@@ -213,16 +227,38 @@ export const updateTimelineActorPresentation = async (
      WHERE boosted_by_actor_uri = $1`,
     [actorUri, presentation.handle, presentation.display_name],
   )
-  return (author.rowCount ?? 0) + (booster.rowCount ?? 0)
+  return { authors: author.rowCount ?? 0, boosters: booster.rowCount ?? 0 }
+}
+
+/**
+ * Whether ANY local row holds a cached copy of this remote actor — as a
+ * follower, a followee, a timeline post's author or booster, or a reaction on
+ * one of the owner's posts. The gate on the inbound `Update{Person}` refresh
+ * (#1111): without it any signed actor can make us dereference their actor
+ * document (and run four no-op UPDATEs) by delivering an Update we have no use
+ * for. Every table the refresh touches is checked, so a stranger whose reply or
+ * Like we DO store still gets their byline refreshed.
+ */
+export const hasCachedActorPresentation = async (user: string, actorUri: string): Promise<boolean> => {
+  const result = await query<{ cached: boolean }>(
+    user,
+    `SELECT true AS cached
+       WHERE EXISTS (SELECT 1 FROM feed_follower WHERE actor_uri = $1)
+          OR EXISTS (SELECT 1 FROM feed_following WHERE actor_uri = $1)
+          OR EXISTS (SELECT 1 FROM timeline_entry WHERE actor_uri = $1 OR boosted_by_actor_uri = $1)
+          OR EXISTS (SELECT 1 FROM feed_post_reaction WHERE actor_uri = $1)`,
+    [actorUri],
+  )
+  return result.rows.length > 0
 }
 
 /** Reply visibility for a timeline page (from the `timeline_show_replies` setting). */
 export interface TimelineReplyFilter {
   /**
-   * When false, replies to OTHER people's posts are excluded from the page. A
-   * BOOST card never counts as a reply: it inherits the boosted Note's
-   * `in_reply_to_uri`, but the card is the booster's boost, not their reply —
-   * Mastodon shows reblogs of replies either way.
+   * When false, only replies to posts that are NOT in this timeline are
+   * excluded. A BOOST card never counts as a reply: it inherits the boosted
+   * Note's `in_reply_to_uri`, but the card is the booster's boost, not their
+   * reply — Mastodon shows reblogs of replies either way.
    */
   show_replies: boolean
   /**
@@ -233,11 +269,33 @@ export interface TimelineReplyFilter {
   own_object_prefix: string
 }
 
-const escapeLike = (s: string): string => s.replaceAll(/[%_\\]/g, (c) => `\\${c}`)
+/** Escape LIKE's own wildcards so a prefix match is a literal prefix match. */
+export const escapeLike = (s: string): string => s.replaceAll(/[%_\\]/g, (c) => `\\${c}`)
+
+/**
+ * The "does this row pass the reader's reply filter" predicate, as one SQL
+ * fragment, so the timeline page and the live-notification check (#1062) can
+ * never drift apart. `showReplies` / `prefix` are the placeholders of the
+ * `boolean` setting and the escaped own-object prefix pattern.
+ *
+ * With the setting off, a reply still shows when the reader is involved
+ * (a reply to their own post, or a Mention of them), when the card is a boost,
+ * and when it answers a post that IS in this timeline — a followee continuing
+ * their own thread, or two followees talking to each other, which is what
+ * Mastodon's home shows. Only replies to posts outside the timeline are hidden.
+ */
+export const timelineReplyFilterSql = (showReplies: string, prefix: string): string =>
+  `(${showReplies}::boolean OR in_reply_to_uri IS NULL OR boost_of_uri IS NOT NULL
+      OR mentions_me OR in_reply_to_uri LIKE ${prefix}
+      OR EXISTS (SELECT 1 FROM timeline_entry p WHERE p.object_uri = timeline_entry.in_reply_to_uri))`
+
+/** The LIKE pattern matching the reader's own post objects, or a never-matching one. */
+const ownObjectPattern = (replies?: TimelineReplyFilter): string =>
+  replies == null ? '' : `${escapeLike(replies.own_object_prefix)}%`
 
 /**
  * A page of the home timeline, newest first. Keyset-paginated: pass the previous
- * page's last `(published_at, id)` as `before` to get the next page. Returns up
+ * page's last `(cursor_ts, id)` as `before` to get the next page. Returns up
  * to `limit` rows. Filtering happens in SQL (not post-hoc) so pages stay full
  * and cursors stable whatever the reply setting.
  */
@@ -246,13 +304,12 @@ export const listTimelineEntries = async (
   limit: number,
   before?: TimelineCursor,
   replies?: TimelineReplyFilter,
-): Promise<TimelineEntryRecord[]> => {
-  const result = await query<TimelineEntryRecord>(
+): Promise<TimelinePageRow[]> => {
+  const result = await query<TimelinePageRow>(
     user,
-    `SELECT ${TIMELINE_COLUMNS} FROM timeline_entry
+    `SELECT ${TIMELINE_COLUMNS}, published_at::text AS cursor_ts FROM timeline_entry
      WHERE ($1::timestamptz IS NULL OR (published_at, id) < ($1::timestamptz, $2::uuid))
-       AND ($4::boolean OR in_reply_to_uri IS NULL OR boost_of_uri IS NOT NULL
-            OR mentions_me OR in_reply_to_uri LIKE $5)
+       AND ${timelineReplyFilterSql('$4', '$5')}
      ORDER BY published_at DESC, id DESC
      LIMIT $3`,
     [
@@ -260,10 +317,32 @@ export const listTimelineEntries = async (
       before?.id ?? null,
       limit,
       replies?.show_replies ?? true,
-      replies == null ? '' : `${escapeLike(replies.own_object_prefix)}%`,
+      ownObjectPattern(replies),
     ],
   )
   return result.rows
+}
+
+/**
+ * Whether one stored entry would appear on the reader's own timeline under
+ * `filter` — the SAME predicate the page uses. Backs the live-notification
+ * decision (#1062): a reply the reader has chosen not to see must not ping them
+ * about a card that isn't there.
+ */
+export const isTimelineEntryVisible = async (
+  user: string,
+  id: string,
+  filter: TimelineReplyFilter,
+): Promise<boolean> => {
+  // Nothing is filtered with the setting on, so the query is pure overhead.
+  if (filter.show_replies) return true
+  const result = await query<{ visible: boolean }>(
+    user,
+    `SELECT true AS visible FROM timeline_entry
+     WHERE id = $1 AND ${timelineReplyFilterSql('$2', '$3')}`,
+    [id, filter.show_replies, ownObjectPattern(filter)],
+  )
+  return result.rows.length > 0
 }
 
 /** One timeline entry by its local id, or null. */

@@ -1,6 +1,5 @@
 import type {
   CreateSharedDashboardBody,
-  FeedPost,
   FeedPostsResponse,
   PublicProfileResponse,
   SharedDashboard,
@@ -61,10 +60,14 @@ export const fetchPublicProfile = async (username: string): Promise<PublicProfil
   return response.data
 }
 
-/** A user's public/unlisted feed posts (newest-first) for their profile page. */
-export const fetchPublicPosts = async (username: string): Promise<FeedPost[]> => {
+/**
+ * One keyset page of a user's public/unlisted feed posts (newest-first) for
+ * their profile page. Pass the previous page's `next_cursor` for the next one.
+ */
+export const fetchPublicPosts = async (username: string, cursor?: string): Promise<FeedPostsResponse> => {
   const response = await axios.get<FeedPostsResponse>(
     `${API_URL}/public/${encodeURIComponent(username)}/posts`,
+    { params: cursor == null ? {} : { cursor } },
   )
-  return response.data.posts
+  return response.data
 }

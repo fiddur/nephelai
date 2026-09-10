@@ -222,30 +222,44 @@ export const listReplyPostsTo = async (user: string, objectUri: string): Promise
 
 /** Keyset position in the owner's feed: the previous page's last `(created_at, id)`. */
 export interface FeedPostCursor {
-  created_at: Date
+  /** `created_at` as Postgres text (µs precision) — see `cursor_ts`. */
+  created_at: string
   id: string
 }
+
+/**
+ * A listing row plus the exact keyset position it sits at: `created_at` rendered
+ * by Postgres itself, at the microsecond precision the page predicate compares
+ * at. `pg` parses `timestamptz` into a ms-only JS `Date`, so the record's own
+ * `created_at` cannot address a row inside its millisecond (#1025). Cursor use
+ * only — never serialised onto a DTO.
+ */
+export interface FeedPostPageRow extends FeedPostRecord {
+  cursor_ts: string
+}
+
+const mapFeedPostPageRow = (row: FeedPostRow & { cursor_ts: string }): FeedPostPageRow => ({ ...row })
 
 /**
  * A keyset page of the owner's feed posts, newest-first (#1012). The `id`
  * tiebreaker keeps ordering deterministic when two posts share a `created_at`
  * (microsecond collision on rapid inserts); pass the previous page's last
- * `(created_at, id)` as `before` for the next page.
+ * `(cursor_ts, id)` as `before` for the next page.
  */
 export const listFeedPosts = async (
   user: string,
   limit: number,
   before?: FeedPostCursor,
-): Promise<FeedPostRecord[]> => {
-  const result = await query<FeedPostRow>(
+): Promise<FeedPostPageRow[]> => {
+  const result = await query<FeedPostRow & { cursor_ts: string }>(
     user,
-    `SELECT ${FEED_POST_COLUMNS} FROM feed_posts
+    `SELECT ${FEED_POST_COLUMNS}, created_at::text AS cursor_ts FROM feed_posts
      WHERE ($1::timestamptz IS NULL OR (created_at, id) < ($1::timestamptz, $2::uuid))
      ORDER BY created_at DESC, id DESC
      LIMIT $3`,
     [before?.created_at ?? null, before?.id ?? null, limit],
   )
-  return result.rows.map(mapFeedPost)
+  return result.rows.map(mapFeedPostPageRow)
 }
 
 /**
@@ -295,6 +309,31 @@ export const listPublicFeedPostsPage = async (
     [limit, offset, opts.includeReplies ?? true],
   )
   return result.rows.map(mapFeedPost)
+}
+
+/**
+ * A keyset page of the posts a profile lists publicly, newest-first (#1055) —
+ * the same `(created_at, id)` pagination the owner's `/feed` uses, so posts past
+ * the first page stay reachable from `/u/:username`. `opts.includeReplies`
+ * behaves as in {@link listPublicFeedPostsPage}.
+ */
+export const listPublicFeedPostsKeyset = async (
+  user: string,
+  limit: number,
+  before?: FeedPostCursor,
+  opts: PublicFeedPageOpts = {},
+): Promise<FeedPostPageRow[]> => {
+  const result = await query<FeedPostRow & { cursor_ts: string }>(
+    user,
+    `SELECT ${FEED_POST_COLUMNS}, created_at::text AS cursor_ts FROM feed_posts
+      WHERE visibility IN ('public', 'unlisted')
+        AND ($4::boolean OR kind <> 'reply')
+        AND ($1::timestamptz IS NULL OR (created_at, id) < ($1::timestamptz, $2::uuid))
+      ORDER BY created_at DESC, id DESC
+      LIMIT $3`,
+    [before?.created_at ?? null, before?.id ?? null, limit, opts.includeReplies ?? true],
+  )
+  return result.rows.map(mapFeedPostPageRow)
 }
 
 /** Total number of posts on the public outbox (see `listPublicFeedPosts`). */

@@ -1,10 +1,15 @@
-import { Document, Image, Note } from '@fedify/fedify/vocab'
+import { Document, Image, Link, Mention, Note } from '@fedify/fedify/vocab'
 import { describe, expect, test } from 'vitest'
 
 import type { FeedFollowingRecord } from '../../db/index.ts'
 
 import { dateToTemporalInstant } from './temporal-interop.ts'
-import { extractNoteImages, noteToTimelineInput, sanitizeRemoteHtml } from './timeline-ingest.ts'
+import {
+  extractNoteImages,
+  noteMentionsActor,
+  noteToTimelineInput,
+  sanitizeRemoteHtml,
+} from './timeline-ingest.ts'
 
 /** Build the ambient `Temporal.Instant` a `Note` expects from an ISO string. */
 const published = (iso: string) => dateToTemporalInstant(new Date(iso))
@@ -305,5 +310,37 @@ describe('extractNoteImages', () => {
       published: published('2026-07-02T08:30:00Z'),
     })
     expect(await extractNoteImages(note)).toEqual([])
+  })
+})
+
+describe('noteMentionsActor', () => {
+  const ME = 'https://aurboda.example/users/freja'
+  const noteWithTags = (tags: unknown[]) =>
+    new Note({
+      content: '<p>hi</p>',
+      id: new URL('https://mastodon.example/statuses/1'),
+      published: published('2026-07-01T08:00:00Z'),
+      tags: tags as never[],
+    })
+
+  test('true for a Mention of the timeline owner', async () => {
+    const note = noteWithTags([new Mention({ href: new URL(ME), name: '@freja@aurboda.example' })])
+    expect(await noteMentionsActor(note, ME)).toBe(true)
+  })
+
+  test('false for a Mention of somebody else', async () => {
+    const note = noteWithTags([
+      new Mention({ href: new URL('https://mastodon.example/users/bob'), name: '@bob@mastodon.example' }),
+    ])
+    expect(await noteMentionsActor(note, ME)).toBe(false)
+  })
+
+  test('false for a non-Mention tag pointing at the owner (a hashtag Link isn’t a mention)', async () => {
+    const note = noteWithTags([new Link({ href: new URL(ME), name: '#freja' })])
+    expect(await noteMentionsActor(note, ME)).toBe(false)
+  })
+
+  test('false for a Note with no tags at all', async () => {
+    expect(await noteMentionsActor(noteWithTags([]), ME)).toBe(false)
   })
 })

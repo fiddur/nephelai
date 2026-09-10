@@ -1,4 +1,7 @@
-import { useQuery } from '@tanstack/react-query'
+import type { FeedPostsResponse } from '@aurboda/api-spec'
+import type { InfiniteData } from '@tanstack/react-query'
+
+import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import { useRoute } from 'preact-iso'
 
 /**
@@ -22,8 +25,19 @@ export function PublicProfile() {
     staleTime: 60 * 1000,
   })
 
-  const postsQuery = useQuery({
-    queryFn: () => fetchPublicPosts(username),
+  // Keyset-paginated with a "Load more", exactly like the owner's own feed
+  // (#1055): every page carries full structured payloads, so the profile shows a
+  // bounded page at a time instead of a hard ceiling of 20.
+  const postsQuery = useInfiniteQuery<
+    FeedPostsResponse,
+    Error,
+    InfiniteData<FeedPostsResponse>,
+    readonly string[],
+    string | undefined
+  >({
+    getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
+    initialPageParam: undefined,
+    queryFn: ({ pageParam }) => fetchPublicPosts(username, pageParam),
     queryKey: ['publicPosts', username],
     retry: false,
     staleTime: 60 * 1000,
@@ -48,7 +62,7 @@ export function PublicProfile() {
 
   const dashboards = query.data.dashboards ?? []
   const challenges = query.data.challenges ?? []
-  const posts = postsQuery.data ?? []
+  const posts = postsQuery.data?.pages.flatMap((page) => page.posts) ?? []
 
   // The profile owner is the author of every post shown here; the same identity
   // the owner's own feed builds (`@user@host`, avatar on this host).
@@ -90,6 +104,16 @@ export function PublicProfile() {
           <p class="public-muted">This user has no public posts.</p>
         ) : (
           posts.map((post) => <FeedPostCard key={post.id} post={post} author={author} />)
+        )}
+        {postsQuery.hasNextPage && (
+          <button
+            type="button"
+            class="btn-secondary timeline-more"
+            onClick={() => postsQuery.fetchNextPage()}
+            disabled={postsQuery.isFetchingNextPage}
+          >
+            {postsQuery.isFetchingNextPage ? 'Loading…' : 'Load more'}
+          </button>
         )}
       </section>
 

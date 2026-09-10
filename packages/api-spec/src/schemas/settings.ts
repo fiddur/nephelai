@@ -88,7 +88,11 @@ export const gravlApiTokenSchema = z.string().min(1, 'Gravl API token cannot be 
  */
 export const syncIntervalsSchema = z
   .record(
-    z.string().meta({ description: 'Provider name (gravl, garmin, oura, rescuetime, lastfm, calendar) or "default"' }),
+    z
+      .string()
+      .meta({
+        description: 'Provider name (gravl, garmin, oura, rescuetime, lastfm, calendar) or "default"',
+      }),
     z.number().int().min(5).max(1440).meta({ description: 'Poll interval in minutes (5–1440)' }),
   )
   .meta({
@@ -240,10 +244,6 @@ export const updateSettingsInputSchema = z
     rescue_time_key: rescueTimeKeySchema.nullable().optional().meta({
       description: 'RescueTime API key (set to null to clear)',
     }),
-    timeline_show_replies: z.boolean().nullable().optional().meta({
-      description:
-        'When true, replies from followed actors to OTHER people show as their own home-timeline cards; when false (default), only their top-level posts and replies to your own posts appear (set to null to reset to the default).',
-    }),
     sensitivity_areas: sensitivityAreasSchema.nullable().optional().meta({
       description: 'Sensitivity areas to track in meals (set to null to clear)',
     }),
@@ -256,6 +256,10 @@ export const updateSettingsInputSchema = z
     tag_mappings: tagMappingsSchema.nullable().optional().meta({
       description: 'Tag name mappings (set to null to clear all)',
     }),
+    timeline_show_replies: z.boolean().nullable().optional().meta({
+      description:
+        "When true, followed actors' replies show as their own home-timeline cards whatever they answer; when false (default), replies to posts that aren't in your timeline are hidden — replies to your own posts, posts mentioning you, and replies within a thread you already see always appear (set to null to reset to the default).",
+    }),
     training_load: trainingLoadSettingsSchema.nullable().optional().meta({
       description: 'Training load (Banister model) parameters (set to null to reset to defaults)',
     }),
@@ -263,10 +267,12 @@ export const updateSettingsInputSchema = z
       description: 'Garmin data types to skip during sync (set to null to clear, enabling all)',
     }),
     gravl_api_token: gravlApiTokenSchema.nullable().optional().meta({
-      description: 'Gravl personal access token (set to null to clear). Ignored for sync while an OAuth grant exists.',
+      description:
+        'Gravl personal access token (set to null to clear). Ignored for sync while an OAuth grant exists.',
     }),
     sync_intervals: syncIntervalsSchema.nullable().optional().meta({
-      description: 'Background sync poll intervals in minutes per provider (set to null to reset to server defaults)',
+      description:
+        'Background sync poll intervals in minutes per provider (set to null to reset to server defaults)',
     }),
   })
   .meta({ id: 'UpdateSettingsInput' })
@@ -325,17 +331,17 @@ export const userSettingsResponseSchema = baseResponseSchema
     gravl_configured: z
       .boolean()
       .default(false)
-      .meta({ description: 'Whether a Gravl OAuth app is configured on the server (enables "Connect Gravl")' }),
+      .meta({
+        description: 'Whether a Gravl OAuth app is configured on the server (enables "Connect Gravl")',
+      }),
     gravl_connection: z
       .enum(['oauth', 'token'])
       .nullable()
       .default(null)
-      .meta({ description: 'How Gravl is connected: an OAuth grant, a personal token, or null when not connected' }),
+      .meta({
+        description: 'How Gravl is connected: an OAuth grant, a personal token, or null when not connected',
+      }),
     rescue_time_key: z.string().nullable().default(null).meta({ description: 'RescueTime API key' }),
-    timeline_show_replies: z.boolean().default(false).meta({
-      description:
-        "Whether followed actors' replies to other people show as their own home-timeline cards (replies to your own posts always show)",
-    }),
     strava_connected: z
       .boolean()
       .default(false)
@@ -360,6 +366,10 @@ export const userSettingsResponseSchema = baseResponseSchema
     tag_mappings: tagMappingsSchema
       .default({})
       .meta({ description: 'Tag name mappings from UUIDs to display names' }),
+    timeline_show_replies: z.boolean().default(false).meta({
+      description:
+        "Whether followed actors' replies to posts that aren't in your timeline show as their own home-timeline cards (replies to you, mentions of you, and replies within a thread you already see always show)",
+    }),
     training_load: trainingLoadSettingsSchema
       .nullable()
       .default(null)
