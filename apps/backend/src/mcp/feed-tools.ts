@@ -43,7 +43,7 @@ import { REPLIES_TIMEOUT_MS } from '../services/activitypub/remote-replies.ts'
 import { buildArticleMarkdown, renderableArticleBlocks } from '../services/article-export.ts'
 import { buildArticleContent, mergeArticleContent } from '../services/article.ts'
 import { resolveChallengeShare } from '../services/challenge-share.ts'
-import { serializeFeedPostReaction } from '../services/feed-reactions.ts'
+import { MAX_POST_REACTIONS, serializeFeedPostReaction } from '../services/feed-reactions.ts'
 import {
   getFeedPage,
   normalizeFeedMessage,
@@ -64,9 +64,6 @@ const followerStatusFilter = (status: 'accepted' | 'all' | 'pending'): { accepte
   if (status === 'accepted') return { accepted: true }
   return {}
 }
-
-/** Newest-first cap on the "who liked / boosted this" list (parity with the REST route). */
-const MAX_POST_REACTIONS = 100
 
 /** The injectable collaborators behind the feed tools (all optional). */
 export interface FeedToolsOptions {

@@ -10,6 +10,8 @@
  * the following list. `accepted` records that the followee's server answered our
  * Follow with an `Accept`.
  */
+import type { CachedActorPresentation } from './types.ts'
+
 import { query } from './connection.ts'
 
 export interface FeedFollowingRecord {
@@ -69,6 +71,27 @@ export const upsertFeedFollowing = async (
     ],
   )
   return result.rows[0]
+}
+
+/**
+ * Refresh a followee's cached presentation from an inbound `Update{Person}`
+ * (#1057), so the following list and everything rendered from it stop showing a
+ * name the actor has since changed. Returns whether such a followee existed.
+ * Presentation columns only — never the cached inbox URIs (see
+ * `updateFeedFollowerPresentation`).
+ */
+export const updateFeedFollowingPresentation = async (
+  user: string,
+  actorUri: string,
+  presentation: CachedActorPresentation,
+): Promise<boolean> => {
+  const result = await query(
+    user,
+    `UPDATE feed_following SET handle = $2, display_name = $3, avatar_url = $4
+     WHERE actor_uri = $1`,
+    [actorUri, presentation.handle, presentation.display_name, presentation.avatar_url],
+  )
+  return (result.rowCount ?? 0) > 0
 }
 
 /** All followees (accepted + pending), newest first, for the owner-facing list. */

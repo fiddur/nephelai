@@ -58,7 +58,7 @@ import { REPLIES_TIMEOUT_MS } from '../services/activitypub/remote-replies.ts'
 import { buildArticleMarkdown, renderableArticleBlocks } from '../services/article-export.ts'
 import { buildArticleContent, mergeArticleContent } from '../services/article.ts'
 import { resolveChallengeShare } from '../services/challenge-share.ts'
-import { serializeFeedPostReaction } from '../services/feed-reactions.ts'
+import { MAX_POST_REACTIONS, serializeFeedPostReaction } from '../services/feed-reactions.ts'
 import {
   getFeedPage,
   normalizeFeedMessage,
@@ -105,9 +105,6 @@ export interface FeedDeliver {
 
 /** RFC 4122 canonical form — timeline entry ids are UUIDs. */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-
-/** Newest-first cap on the "who liked / boosted this" list. */
-const MAX_POST_REACTIONS = 100
 
 /**
  * Map a reaction toggle's outcome to its HTTP status + body. Pure, so the four
@@ -326,7 +323,6 @@ export const createFeedRouter = (
   // The comments under one of the owner's OWN posts: the replies this instance
   // already holds as timeline entries (any actor's Note answering an existing
   // own post is admitted on ingest — #1060), oldest first. No network.
-  // Registered before the generic `/:postId` routes, like `/reactions`.
   router.get<{ postId: string }, FeedPostRepliesResponse>(
     '/:postId/replies',
     authMiddleware,

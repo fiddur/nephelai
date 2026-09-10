@@ -20,6 +20,25 @@ import type {
 } from '@aurboda/api-spec'
 
 // ============================================================================
+// Feed (ActivityPub) — cached remote-actor presentation
+// ============================================================================
+
+/**
+ * A remote actor's cached presentation snapshot (handle / display name /
+ * avatar). Several feed tables keep one, and an inbound `Update{Person}`
+ * refreshes them together (#1057).
+ *
+ * Declared here rather than imported from the ActivityPub service that produces
+ * it (`ActorPresentation`, the same three fields): the db layer never imports
+ * from services.
+ */
+export interface CachedActorPresentation {
+  handle: string | null
+  display_name: string | null
+  avatar_url: string | null
+}
+
+// ============================================================================
 // Raw Records
 // ============================================================================
 

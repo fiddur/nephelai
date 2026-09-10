@@ -18,9 +18,11 @@ import {
   listTimelineRepliesTo,
   listUnenrichedAurbodaEntries,
   markEnrichTransientFailure,
+  refreshBoostedCopies,
   setTimelineEntryReplyInfo,
   setTimelineEntryStructured,
   type TimelineEntryInput,
+  updateTimelineActorPresentation,
   upsertTimelineEntry,
 } from './timeline.ts'
 
@@ -199,6 +201,33 @@ describe('Timeline store integration', () => {
       show_replies: true,
     })
     expect(all).toHaveLength(3)
+  })
+
+  test('a BOOST of a reply stays visible with replies hidden (#1105)', async () => {
+    const user = getTestUser()
+    const ownPrefix = `https://aurboda.example/users/${user}/feed/`
+    // A followee's own reply to somebody else — hidden.
+    await upsertTimelineEntry(user, entry(1, { in_reply_to_uri: 'https://mastodon.example/notes/root' }))
+    // A boost card inherits the boosted Note's in_reply_to_uri, but it is a
+    // boost, not a reply: Mastodon shows reblogs of replies.
+    await upsertTimelineEntry(
+      user,
+      entry(2, {
+        boost_of_uri: 'https://mastodon.example/notes/1',
+        boosted_by_actor_uri: 'https://remote.example/users/bob',
+        boosted_by_handle: '@bob@remote.example',
+        in_reply_to_uri: 'https://mastodon.example/notes/root',
+        object_uri: 'https://remote.example/users/bob/statuses/9/activity',
+      }),
+    )
+
+    const filtered = await listTimelineEntries(user, 10, undefined, {
+      own_object_prefix: ownPrefix,
+      show_replies: false,
+    })
+    expect(filtered.map((r) => r.object_uri)).toEqual([
+      'https://remote.example/users/bob/statuses/9/activity',
+    ])
   })
 
   test('a mentioned post stays visible with replies hidden; getTimelineEntryById resolves (#1060)', async () => {
@@ -412,6 +441,72 @@ describe('Timeline store integration', () => {
       ])
     })
 
+    test('refreshBoostedCopies carries an author’s edit to the boost cards, keeping their sort order', async () => {
+      const user = getTestUser()
+      const structured = {
+        activity_type: 'exercise',
+        kind: 'activity' as const,
+        metrics: [{ key: 'distance', unit: 'km', value: 5 }],
+        series: [],
+        start_time: '2026-07-01T08:00:00.000Z',
+      }
+      const direct = await upsertTimelineEntry(user, entry(1))
+      await upsertTimelineEntry(user, boostOfAlice({ structured }))
+      const images = [{ url: 'https://mastodon.example/media/1.png' }]
+
+      expect(
+        await refreshBoostedCopies(user, 'https://mastodon.example/notes/1', {
+          content: '<p>edited</p>',
+          images,
+          structured: null,
+          url: 'https://mastodon.example/@alice/1',
+        }),
+      ).toBe(1)
+
+      const rows = await listTimelineEntries(user, 10)
+      const boost = rows.find((e) => e.object_uri === ANNOUNCE)
+      expect(boost?.content).toBe('<p>edited</p>')
+      expect(boost?.images).toEqual(images)
+      // A boost card sorts at BOOST time — an edit must not move it.
+      expect(boost?.published_at.toISOString()).toBe('2026-07-01T12:00:00.000Z')
+      // A refresh that couldn't re-fetch the payload keeps the working chart.
+      expect(boost?.structured).toEqual(structured)
+      // The direct entry is the ingest's own upsert, not this statement's job.
+      expect(rows.find((e) => e.id === direct.id)?.content).toBe('<p>post 1</p>')
+    })
+
+    test('updateTimelineActorPresentation refreshes an actor as author AND as booster (#1057)', async () => {
+      const user = getTestUser()
+      const alice = 'https://mastodon.example/users/alice'
+      await upsertTimelineEntry(user, entry(1))
+      await upsertTimelineEntry(user, boostOfAlice())
+
+      // Bob boosted; he is nobody's author here, so only the boost line moves.
+      expect(
+        await updateTimelineActorPresentation(user, BOB, {
+          avatar_url: null,
+          display_name: 'Bob Renamed',
+          handle: '@bob@remote.example',
+        }),
+      ).toBe(1)
+      const afterBob = await listTimelineEntries(user, 10)
+      expect(afterBob.find((e) => e.object_uri === ANNOUNCE)?.boosted_by_display_name).toBe('Bob Renamed')
+      expect(afterBob.map((e) => e.display_name)).toEqual(['Alice', 'Alice'])
+
+      // Alice authored both rows (a boost card renders HER post), so both
+      // bylines move — and the booster's line is left alone.
+      expect(
+        await updateTimelineActorPresentation(user, alice, {
+          avatar_url: 'https://mastodon.example/avatars/alice2.png',
+          display_name: 'Alice Renamed',
+          handle: '@alice@mastodon.example',
+        }),
+      ).toBe(2)
+      const afterAlice = await listTimelineEntries(user, 10)
+      expect(afterAlice.map((e) => e.display_name)).toEqual(['Alice Renamed', 'Alice Renamed'])
+      expect(afterAlice.find((e) => e.object_uri === ANNOUNCE)?.boosted_by_display_name).toBe('Bob Renamed')
+    })
+
     test('unfollowing drops the actor’s own posts and their boosts, but not others’ boosts of them', async () => {
       const user = getTestUser()
       const alice = 'https://mastodon.example/users/alice'
@@ -476,6 +571,25 @@ describe('Timeline store integration', () => {
           [OTHER, 1],
         ]),
       )
+    })
+
+    test('a boost of a reply is neither listed nor counted as a comment (#1108)', async () => {
+      const user = getTestUser()
+      const reply = await upsertTimelineEntry(user, entry(1, { in_reply_to_uri: TARGET }))
+      // A followee boosting that reply copies its in_reply_to_uri, so without
+      // the boost filter the same comment would show (and count) twice.
+      await upsertTimelineEntry(
+        user,
+        entry(2, {
+          boost_of_uri: 'https://mastodon.example/notes/1',
+          boosted_by_actor_uri: 'https://remote.example/users/bob',
+          in_reply_to_uri: TARGET,
+          object_uri: 'https://remote.example/users/bob/statuses/9/activity',
+        }),
+      )
+
+      expect((await listTimelineRepliesTo(user, TARGET, 100)).map((r) => r.id)).toEqual([reply.id])
+      expect(await countTimelineRepliesTo(user, [TARGET])).toEqual([{ count: 1, in_reply_to_uri: TARGET }])
     })
 
     test('countTimelineRepliesTo short-circuits on an empty list', async () => {

@@ -39,6 +39,27 @@ describe('patchTimelineEntry', () => {
     expect(patchTimelineEntry(undefined, 'a', (e) => e)).toBeUndefined()
   })
 
+  it('rolls one entry back without discarding pages fetched meanwhile', () => {
+    // The failure path of an optimistic toggle: restore THIS entry to what it
+    // was, on whatever the cache holds now — a page fetched (or another card
+    // toggled) while the request was in flight must survive the rollback.
+    const before = entry('a')
+    const optimistic = pages([{ ...before, liked: true }])
+    const grown: TimelinePages = {
+      ...optimistic,
+      pageParams: [...optimistic.pageParams, undefined],
+      pages: [
+        { ...optimistic.pages[0], entries: [optimistic.pages[0].entries[0], entry('b', { boosted: true })] },
+        { entries: [entry('c')], next_cursor: null, success: true },
+      ],
+    }
+
+    const rolledBack = patchTimelineEntry(grown, 'a', () => before)
+    expect(rolledBack?.pages[0].entries[0]).not.toHaveProperty('liked')
+    expect(rolledBack?.pages[0].entries[1].boosted).toBe(true)
+    expect(rolledBack?.pages[1].entries[0].id).toBe('c')
+  })
+
   it('does not mutate the input (react-query caches must stay immutable)', () => {
     const data = pages([entry('a')])
     patchTimelineEntry(data, 'a', (e) => ({ ...e, boosted: true }))

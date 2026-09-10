@@ -1,6 +1,4 @@
-import type { InboxContext } from '@fedify/fedify'
-
-import { Announce, Like, Note, Person, Undo } from '@fedify/fedify/vocab'
+import { Announce, Like, Note, Person, Undo, Update } from '@fedify/fedify/vocab'
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
 
 /**
@@ -19,11 +17,13 @@ import { listFeedPostReactions } from '../../db/feed-reactions.ts'
 import { createFeedPost } from '../../db/feed.ts'
 import { listTimelineEntries, upsertTimelineEntry } from '../../db/timeline.ts'
 import { cleanTestDb, getTestUser, startTestDb, stopTestDb } from '../../test/db-test-helper.ts'
+import { actorDocument, inboxContext, type StubDocuments } from '../../test/inbox-context.ts'
 import {
   createFeedFederation,
   handleInboundAnnounce,
   handleInboundLike,
   handleInboundUndo,
+  handleInboundUpdate,
 } from './federation.ts'
 import { dateToTemporalInstant } from './temporal-interop.ts'
 
@@ -34,39 +34,12 @@ const CAROL = 'https://third.example/users/carol'
 
 const fed = createFeedFederation(ORIGIN, `${ORIGIN}/api`)
 
-/** A stub document loader: the fediverse documents this test makes available. */
-const stubLoader = (docs: Record<string, unknown>) => async (url: string) => {
-  const document = docs[url]
-  if (document == null) throw new Error(`stub loader has no document for ${url}`)
-  return { contextUrl: null, document, documentUrl: url }
-}
-
-/**
- * A real Fedify context (so `parseUri` resolves our own object URLs) wearing the
- * `recipient` an inbox delivery would carry, and optionally a stub document
- * loader so a bare-URI `object`/`attributedTo` resolves without a network.
- */
-const inboxCtx = (user: string, docs: Record<string, unknown> = fediverse()): InboxContext<void> => {
-  const base = fed.createContext(new URL(ORIGIN), undefined)
-  const loader = stubLoader(docs)
-  return new Proxy(base, {
-    get: (target, prop, receiver) => {
-      if (prop === 'recipient') return user
-      // Only the DOCUMENT loader is stubbed: the context loader must stay the
-      // real one, which serves the bundled AS2 `@context`.
-      if (prop === 'documentLoader') return loader
-      const value = Reflect.get(target, prop) as unknown
-      // Bound to the PROXY, not the target: `ctx.lookupObject()` reads
-      // `this.documentLoader`, so binding to the target would quietly reach past
-      // the stub and try the network.
-      return typeof value === 'function' ? value.bind(receiver) : value
-    },
-  }) as unknown as InboxContext<void>
-}
+/** This suite's inbox context: the shared helper, defaulting to the fediverse below. */
+const inboxCtx = (user: string, docs: StubDocuments = fediverse()) => inboxContext(fed, ORIGIN, user, docs)
 
 /**
  * Alice INLINED in an activity. Nothing may be read off this: the code fetches
- * her actor document from her id instead (see `actorDoc`), so an inlined actor
+ * her actor document from her id instead (see `actorDocument`), so an inlined actor
  * is only ever the `actorId` carrier.
  */
 const alicePerson = () =>
@@ -76,16 +49,6 @@ const alicePerson = () =>
     name: 'Alice',
     preferredUsername: 'alice',
   })
-
-/** An actor document as its own server would serve it. */
-const actorDoc = (id: string, username: string, name: string) => ({
-  '@context': 'https://www.w3.org/ns/activitystreams',
-  id,
-  inbox: `${id}/inbox`,
-  name,
-  preferredUsername: username,
-  type: 'Person',
-})
 
 const ownPost = async (user: string) => {
   const activityId = await insertActivity(user, {
@@ -113,8 +76,8 @@ const CAROL_NOTE = 'https://third.example/notes/1'
  * bare object URI, so this is the path production actually takes).
  */
 const fediverse = (noteOverrides: Record<string, unknown> | null = {}) => ({
-  [ALICE]: actorDoc(ALICE, 'alice', 'Alice'),
-  [CAROL]: actorDoc(CAROL, 'carol', 'Carol'),
+  [ALICE]: actorDocument(ALICE, 'alice', 'Alice'),
+  [CAROL]: actorDocument(CAROL, 'carol', 'Carol'),
   // `null` means "nothing lives at that id" — the loader then 404s it.
   ...(noteOverrides === null
     ? {}
@@ -403,6 +366,39 @@ describe('Inbound likes and boosts', () => {
     )
     const entries = await listTimelineEntries(user, 10)
     expect(entries.map((e) => e.object_uri)).toEqual([CAROL_NOTE])
+  })
+
+  test('an author’s Update{Note} refreshes the boost cards of that post too', async () => {
+    const user = getTestUser()
+    // Alice boosts Carol's post first (so a boost card exists), and only then do
+    // we follow Carol — the order that leaves a boost card beside a direct entry.
+    await acceptFollow(user, ALICE, '@alice@mastodon.example')
+    await handleInboundAnnounce(inboxCtx(user), boostOfCarol(`${ALICE}/statuses/9/activity`), ORIGIN)
+    await acceptFollow(user, CAROL, '@carol@third.example')
+
+    await handleInboundUpdate(
+      inboxCtx(user),
+      new Update({
+        actor: new URL(CAROL),
+        id: new URL(`${CAROL_NOTE}#update-1`),
+        object: new Note({
+          attribution: new URL(CAROL),
+          content: '<p>Carol’s edited post</p>',
+          id: new URL(CAROL_NOTE),
+          published: dateToTemporalInstant(new Date('2026-07-01T08:00:00Z')),
+        }),
+      }),
+      ORIGIN,
+    )
+
+    const entries = await listTimelineEntries(user, 10)
+    // The edit reaches the direct entry AND the boost card (keyed on the
+    // Announce id, so the upsert alone never touches it).
+    expect(entries).toHaveLength(2)
+    for (const entry of entries) expect(entry.content).toContain('edited')
+    // The boost card still sorts at boost time, not at the post's timestamp.
+    const boost = entries.find((e) => e.boost_of_uri === CAROL_NOTE)
+    expect(boost?.published_at.toISOString()).toBe('2026-07-01T11:00:00.000Z')
   })
 
   test('an Announce whose id is off the booster’s host can’t overwrite another entry', async () => {

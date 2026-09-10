@@ -3,14 +3,18 @@
  * `federation.fetch` against a real per-user database (no Express/nginx needed).
  */
 import { integrateFederation } from '@fedify/express'
-import { Note } from '@fedify/fedify/vocab'
+import { Create, Follow, Note, Person, Update } from '@fedify/fedify/vocab'
 import express from 'express'
 import supertest from 'supertest'
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
 
 import { insertActivity } from '../../db/activities/index.ts'
-import { upsertFeedFollower } from '../../db/feed-follower.ts'
-import { markFeedFollowingAccepted, upsertFeedFollowing } from '../../db/feed-following.ts'
+import { getFeedFollowerByActor, upsertFeedFollower } from '../../db/feed-follower.ts'
+import {
+  getFeedFollowingByActor,
+  markFeedFollowingAccepted,
+  upsertFeedFollowing,
+} from '../../db/feed-following.ts'
 import {
   createArticlePost,
   createFeedPost,
@@ -22,10 +26,19 @@ import {
 } from '../../db/feed.ts'
 import { getProfileAvatarVersion, upsertProfileAvatar } from '../../db/profile-avatar.ts'
 import { upsertUserSettings } from '../../db/settings.ts'
+import { listTimelineEntries, upsertTimelineEntry } from '../../db/timeline.ts'
 import { createFeedTombstoneRouter } from '../../routes/feed-tombstone-router.ts'
 import { cleanTestDb, getTestUser, startTestDb, stopTestDb } from '../../test/db-test-helper.ts'
+import { actorDocument, inboxContext } from '../../test/inbox-context.ts'
 import { buildFeedUpdate } from './deliver.ts'
-import { buildActorPerson, createFeedFederation } from './federation.ts'
+import {
+  buildActorPerson,
+  createFeedFederation,
+  handleInboundCreate,
+  handleInboundFollow,
+  handleInboundUpdate,
+} from './federation.ts'
+import { dateToTemporalInstant } from './temporal-interop.ts'
 
 const CONTAINER_TIMEOUT = 120_000
 const ORIGIN = 'https://aurboda.example'
@@ -613,6 +626,188 @@ describe('Feed federation actor + WebFinger', () => {
     expect(await getFeedTombstone(user, post.id)).toBeNull()
     const res = await getObject(app, `/users/${user}/feed/${post.id}`)
     expect(res.status).toBe(404)
+  })
+
+  /**
+   * Inbound paths that write a BYLINE from a sending actor (#1103, #1057). Each
+   * activity carries an inlined `Person` claiming to be someone else under
+   * Alice's real id — nothing may be read off it; the snapshot must come from
+   * whatever her id actually serves (`inboxContext`'s stub loader).
+   */
+  describe('inbound actor presentation is never read off the activity', () => {
+    const ALICE = 'https://mastodon.example/users/alice'
+    /** Alice's id, wearing somebody else's name and username. */
+    const forgedAlice = () =>
+      new Person({
+        id: new URL(ALICE),
+        inbox: new URL(`${ALICE}/inbox`),
+        name: 'Site Admin',
+        preferredUsername: 'admin',
+      })
+    const aliceServes = (name = 'Alice') => ({ [ALICE]: actorDocument(ALICE, 'alice', name) })
+
+    const followUs = (user: string) =>
+      new Follow({
+        actor: forgedAlice(),
+        id: new URL(`${ALICE}#follows/1`),
+        object: new URL(`${ORIGIN}/users/${user}`),
+      })
+
+    /** A stranger's reply to one of the owner's posts (the #1060 involvement branch). */
+    const replyToOwnPost = (target: string) =>
+      new Create({
+        actor: forgedAlice(),
+        id: new URL(`${ALICE}/statuses/5/activity`),
+        object: new Note({
+          attribution: new URL(ALICE),
+          content: '<p>Nice run!</p>',
+          id: new URL(`${ALICE}/statuses/5`),
+          published: dateToTemporalInstant(new Date('2026-07-02T09:00:00Z')),
+          replyTarget: new URL(target),
+        }),
+      })
+
+    /** The reader's own post, as a reply target. */
+    const ownPostUri = async (user: string) =>
+      `${ORIGIN}/users/${user}/feed/${(await sharePost(user, await insertExercise(user))).id}`
+
+    test('a Follow is recorded with the byline Alice’s own server serves', async () => {
+      const user = getTestUser()
+      // Manual approval, so the follow is recorded WITHOUT sending an Accept —
+      // this test never touches the network.
+      await upsertUserSettings(user, { manually_approve_followers: true })
+      await handleInboundFollow(inboxContext(fed, ORIGIN, user, aliceServes()), followUs(user))
+
+      const row = await getFeedFollowerByActor(user, ALICE)
+      expect(row).toMatchObject({
+        accepted: false,
+        actor_uri: ALICE,
+        display_name: 'Alice',
+        handle: '@alice@mastodon.example',
+      })
+    })
+
+    test('a Follow whose actor id serves nothing is still recorded, with no byline', async () => {
+      const user = getTestUser()
+      await upsertUserSettings(user, { manually_approve_followers: true })
+      await handleInboundFollow(inboxContext(fed, ORIGIN, user), followUs(user))
+
+      // The follow relationship is real and must not be lost — only the display
+      // fields are unknown. The inbox is delivery addressing, not presentation.
+      const row = await getFeedFollowerByActor(user, ALICE)
+      expect(row).toMatchObject({
+        actor_uri: ALICE,
+        display_name: null,
+        handle: null,
+        inbox_uri: `${ALICE}/inbox`,
+      })
+    })
+
+    test('a stranger’s reply is bylined from the served actor document', async () => {
+      const user = getTestUser()
+      const target = await ownPostUri(user)
+      await handleInboundCreate(
+        inboxContext(fed, ORIGIN, user, aliceServes()),
+        replyToOwnPost(target),
+        ORIGIN,
+      )
+
+      const entries = await listTimelineEntries(user, 10)
+      expect(entries).toHaveLength(1)
+      expect(entries[0]).toMatchObject({ display_name: 'Alice', handle: '@alice@mastodon.example' })
+    })
+
+    test('a stranger’s reply whose actor id serves nothing is dropped', async () => {
+      const user = getTestUser()
+      const target = await ownPostUri(user)
+      // An anonymous stranger card is worse than no card: the branch exists to
+      // show WHO replied.
+      await handleInboundCreate(inboxContext(fed, ORIGIN, user), replyToOwnPost(target), ORIGIN)
+      expect(await listTimelineEntries(user, 10)).toHaveLength(0)
+    })
+
+    /** Every cached copy of Alice: as followee, follower, post author and booster. */
+    const cacheAlice = async (user: string) => {
+      await upsertFeedFollowing(user, {
+        actor_uri: ALICE,
+        display_name: 'Alice',
+        handle: '@alice@mastodon.example',
+        inbox_uri: `${ALICE}/inbox`,
+      })
+      await markFeedFollowingAccepted(user, ALICE)
+      await upsertFeedFollower(user, {
+        accepted: true,
+        actor_uri: ALICE,
+        display_name: 'Alice',
+        handle: '@alice@mastodon.example',
+        inbox_uri: `${ALICE}/inbox`,
+      })
+      await upsertTimelineEntry(user, {
+        actor_uri: ALICE,
+        content: '<p>Alice’s post</p>',
+        display_name: 'Alice',
+        handle: '@alice@mastodon.example',
+        object_uri: `${ALICE}/statuses/1`,
+        published_at: new Date('2026-07-01T10:00:00Z'),
+      })
+      await upsertTimelineEntry(user, {
+        actor_uri: 'https://third.example/users/carol',
+        boost_of_uri: 'https://third.example/notes/1',
+        boosted_by_actor_uri: ALICE,
+        boosted_by_display_name: 'Alice',
+        boosted_by_handle: '@alice@mastodon.example',
+        content: '<p>Carol’s post</p>',
+        object_uri: `${ALICE}/statuses/2/activity`,
+        published_at: new Date('2026-07-01T11:00:00Z'),
+      })
+    }
+
+    /** An `Update{Person}` from `actor`, embedding a claim we must never believe. */
+    const actorUpdate = (actor: string, embeddedId: string) =>
+      new Update({
+        actor: new URL(actor),
+        id: new URL(`${actor}#updates/1`),
+        object: new Person({
+          id: new URL(embeddedId),
+          name: 'Impostor',
+          preferredUsername: 'impostor',
+        }),
+      })
+
+    test('an Update{Person} refreshes every cached copy of that actor (#1057)', async () => {
+      const user = getTestUser()
+      await cacheAlice(user)
+
+      await handleInboundUpdate(
+        inboxContext(fed, ORIGIN, user, aliceServes('Alice Renamed')),
+        actorUpdate(ALICE, ALICE),
+        ORIGIN,
+      )
+
+      expect((await getFeedFollowingByActor(user, ALICE))?.display_name).toBe('Alice Renamed')
+      expect((await getFeedFollowerByActor(user, ALICE))?.display_name).toBe('Alice Renamed')
+      const entries = await listTimelineEntries(user, 10)
+      expect(entries.find((e) => e.actor_uri === ALICE)?.display_name).toBe('Alice Renamed')
+      // The "🔄 X boosted" line is a cached copy of the same actor.
+      expect(entries.find((e) => e.boosted_by_actor_uri === ALICE)?.boosted_by_display_name).toBe(
+        'Alice Renamed',
+      )
+    })
+
+    test('an Update{Person} describing a DIFFERENT actor than the signer is ignored', async () => {
+      const user = getTestUser()
+      await cacheAlice(user)
+
+      // Mallory signs an Update of Alice's profile: the same-actor rule drops it
+      // (and it is no Note either, so nothing is ingested).
+      await handleInboundUpdate(
+        inboxContext(fed, ORIGIN, user, aliceServes('Alice Renamed')),
+        actorUpdate('https://evil.example/users/mallory', ALICE),
+        ORIGIN,
+      )
+
+      expect((await getFeedFollowingByActor(user, ALICE))?.display_name).toBe('Alice')
+    })
   })
 
   test('buildFeedUpdate wraps the post Note in an Update at the canonical object id', async () => {

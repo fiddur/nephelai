@@ -222,8 +222,6 @@ export const serializeFeedPost = async (
     include_chart: record.include_chart,
     include_map: record.include_map,
     included_metrics: record.included_metrics,
-    // Present only for a `reply` post: what it answers (drives the "replying to
-    // @handle" line on the owner's own card).
     ...replyTargetFields(record),
     kind: record.kind,
     message: record.message ?? undefined,

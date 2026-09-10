@@ -14,6 +14,7 @@ import {
   removeFeedFollowing,
   removeFeedFollowingByActor,
   updateFeedFollowingNotify,
+  updateFeedFollowingPresentation,
   upsertFeedFollowing,
 } from './feed-following.ts'
 
@@ -155,5 +156,34 @@ describe('Feed following integration', () => {
     expect(await removeFeedFollowingByActor(user, alice.actor_uri)).toBe(true)
     expect(await removeFeedFollowingByActor(user, alice.actor_uri)).toBe(false)
     expect(await listFeedFollowing(user)).toEqual([])
+  })
+
+  test('refreshes a followee’s presentation from an inbound Update{Person} (#1057)', async () => {
+    const user = getTestUser()
+    await upsertFeedFollowing(user, alice)
+    await markFeedFollowingAccepted(user, alice.actor_uri)
+
+    expect(
+      await updateFeedFollowingPresentation(user, alice.actor_uri, {
+        avatar_url: 'https://mastodon.example/avatars/alice2.png',
+        display_name: 'Alice Renamed',
+        handle: '@alice@mastodon.example',
+      }),
+    ).toBe(true)
+
+    const row = await getFeedFollowingByActor(user, alice.actor_uri)
+    expect(row?.display_name).toBe('Alice Renamed')
+    expect(row?.avatar_url).toBe('https://mastodon.example/avatars/alice2.png')
+    // Neither the cached inbox nor the established follow moves.
+    expect(row?.inbox_uri).toBe(alice.inbox_uri)
+    expect(row?.accepted).toBe(true)
+
+    expect(
+      await updateFeedFollowingPresentation(user, bob.actor_uri, {
+        avatar_url: null,
+        display_name: 'Bob',
+        handle: '@bob@remote.example',
+      }),
+    ).toBe(false)
   })
 })

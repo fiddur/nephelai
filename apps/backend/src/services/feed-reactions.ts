@@ -60,6 +60,9 @@ import { withTimeout } from './with-timeout.ts'
 /** How long to wait for an unfollowed author's actor document before giving up. */
 const AUTHOR_LOOKUP_TIMEOUT_MS = 5000
 
+/** Newest-first cap on the "who liked / boosted this" list, shared by REST + MCP. */
+export const MAX_POST_REACTIONS = 100
+
 export interface ReactionDeps {
   federation: Federation<void>
   /** Canonical web origin, e.g. `https://aurboda.net`. */
@@ -225,6 +228,9 @@ const entryWithReactions = async (
  * two independent sends: without an outbox queue Fedify awaits every follower
  * inbox, so one dead instance would otherwise cancel the author delivery that
  * tells them who boosted (#1079's lesson, same shape).
+ *
+ * `allSettled` never rejects, so a failed leg is logged HERE, naming which one
+ * failed — `deliverReaction`'s catch can only ever see a `Like`.
  */
 const sendBoost = async (
   deps: ReactionDeps,
@@ -233,10 +239,18 @@ const sendBoost = async (
   activity: Announce | Like | Undo,
 ): Promise<void> => {
   const ctx = await deps.federation.createContext(new URL(deps.origin))
-  await Promise.allSettled([
+  const legs = ['followers', 'the author'] as const
+  const results = await Promise.allSettled([
     ctx.sendActivity({ identifier: user }, 'followers', activity),
     ctx.sendActivity({ identifier: user }, rowRecipient(row), activity),
   ])
+  results.forEach((result, index) => {
+    if (result.status !== 'rejected') return
+    console.warn(
+      `⚠️ ${activity.constructor.name} delivery to ${legs[index]} failed for ${user} → ${row.object_uri}:`,
+      result.reason,
+    )
+  })
 }
 
 /** Deliver a `Like`/`Undo{Like}` to the post author's inbox alone (Mastodon does the same). */
@@ -257,8 +271,6 @@ const deliverReaction = async (
   activity: Announce | Like | Undo,
 ): Promise<void> => {
   try {
-    // A Like (and its Undo) goes to the author alone; an Announce (and its Undo)
-    // fans out to followers too.
     if (activity instanceof Like || (activity instanceof Undo && row.kind === 'like')) {
       await sendLike(deps, user, row, activity)
     } else {
