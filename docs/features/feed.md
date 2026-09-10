@@ -223,6 +223,17 @@ and removes the row. Local follows use the exact same path (delivered to the loc
 over loopback), so there is no special-casing. Delivery is best-effort/synchronous, matching
 the rest of the feed — a failed `Follow` POST leaves the pending row so the user can retry.
 
+**Inbound `Update{Person}`** (#1057) — the mirror of the `Update{Person}` we deliver when our
+own profile changes. A remote actor renaming themselves (or changing their avatar) sends one to
+everyone who follows them, and nothing else ever re-reads a remote actor, so without it our
+cached handle / display name / avatar stay stale indefinitely. An `Update` whose object id
+**is** its actor id is the actor editing themselves — that equality is the same-actor rule, so
+an `Update{Person}` describing anybody else is ignored — and the new presentation is then
+fetched from that (signature-verified) actor id, never read off the embedded `Person`. Every
+cached copy is refreshed together: the `feed_follower` and `feed_following` rows, the author
+snapshot on their timeline entries, the "🔄 X boosted" line on cards they boosted, and their
+reactions on the owner's own posts. Presentation only — the cached inbox URIs never move.
+
 Each follow carries a **`notify_on_post`** flag (default `true`), toggled per-actor with the
 bell in the web Following panel (or the `set_following_notify` MCP tool / `PATCH
 /feed/following/:id`). It controls whether the Android app raises a notification for that
@@ -397,19 +408,37 @@ id** and declare `attributedTo` (whose host must match the Note's, as for any in
 post that is **already in the timeline directly** gets no boost card (Mastodon likewise hides a
 reblog of a post you already have).
 
-**An object embedded in an activity is never used.** The announced `Note`, its author, and a
-reactor's actor document are always **dereferenced from their own ids**. This is the security
-of the whole feature, not an optimisation: an AS2 activity may inline its object, and a library
-will hand that inlined copy back without fetching anything — so a followee could deliver an
-`Announce` carrying a `Note` with any `id` and an `attributedTo` `Person` with any
+A boost card tracks the post it shows: the author's `Update{Note}` refreshes the **boost cards
+of that Note** as well as the direct entry (the card is keyed on the `Announce` id, so the
+ingest upsert alone would leave it showing pre-edit content), while its `published_at` stays at
+boost time so it doesn't jump on an edit. And a boost is never treated as a *reply*, even when
+the boosted Note is one: it stays visible with `timeline_show_replies` off (Mastodon shows
+reblogs of replies), and it is left out of an own post's comment list + `reply_count`, which
+would otherwise show the same comment twice under someone else's byline.
+
+**An object embedded in an activity is never used.** The announced `Note`, its author, and
+every actor whose name we store are always **dereferenced from their own ids**. This is the
+security of the whole feature, not an optimisation: an AS2 activity may inline its object, and
+a library will hand that inlined copy back without fetching anything — so a followee could
+deliver an `Announce` carrying a `Note` with any `id` and an `attributedTo` `Person` with any
 `preferredUsername` they chose, and every host/attribution check would be satisfied by data
 they wrote, storing forged content under a real person's byline. Fetching by id makes the
 claimed origin server the only thing that can describe its own posts and people (and the
 lookup refuses a document whose `@id` is cross-origin to the URL it came from). Mastodon sends
-a bare id for a boost anyway, so this is also the ordinary path. `Undo{Announce}` removes the card, scoped to the booster;
-an author's `Delete` removes their post *and* every boost of it; unfollowing removes that
-actor's own posts and their boosts, but keeps other people's boosts of their posts (those are
-in the timeline on the booster's account).
+a bare id for a boost anyway, so this is also the ordinary path.
+
+The rule covers **every inbound path that writes a byline** (#1103), each choosing what an
+unreadable actor document means: an inbound `Like`/`Announce` still records a countable but
+anonymous reaction; an inbound `Follow` still records the follow (the relationship is real)
+with unknown display fields, while its inbox — delivery addressing, not presentation — comes
+from the signature-verified sender as before; a **stranger's** reply/mention Note is dropped
+outright, since showing who replied is the entire point of admitting it; a boosted post's
+author, likewise, yields no card.
+
+`Undo{Announce}` removes the card, scoped to the booster; an author's `Delete` removes their
+post *and* every boost of it; unfollowing removes that actor's own posts and their boosts, but
+keeps other people's boosts of their posts (those are in the timeline on the booster's
+account).
 
 A `followers`-only post can't be boosted meaningfully — the `Announce` is public, but the
 object stays unreadable to anyone who doesn't already follow the author, so their servers show

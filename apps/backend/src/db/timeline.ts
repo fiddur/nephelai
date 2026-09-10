@@ -10,6 +10,8 @@
  */
 import type { FeedStructuredPost, TimelineImage } from '@aurboda/api-spec'
 
+import type { CachedActorPresentation } from './types.ts'
+
 import { query } from './connection.ts'
 
 export interface TimelineEntryRecord {
@@ -146,9 +148,82 @@ export const upsertTimelineEntry = async (
   return result.rows[0]
 }
 
+/** What an author's edit propagates to the boost cards of that Note. */
+export interface BoostedCopyFields {
+  content: string
+  url: string | null
+  images: TimelineImage[] | null
+  structured: FeedStructuredPost | null
+}
+
+/**
+ * Propagate an author's edit to every BOOST card of one Note, returning how many
+ * cards were refreshed. An `Update{Note}` upserts on `object_uri`, which on a
+ * boost card is the `Announce` id — so without this the direct entry is edited
+ * and every boost of it keeps showing the pre-edit content for good.
+ *
+ * `published_at` is deliberately untouched: a boost card sorts at BOOST time,
+ * not at the original post's (or the edit's) timestamp. `structured` is
+ * COALESCEd for the same reason as in the upsert — a transient enrich failure
+ * must not wipe a working chart.
+ */
+export const refreshBoostedCopies = async (
+  user: string,
+  noteUri: string,
+  fields: BoostedCopyFields,
+): Promise<number> => {
+  const result = await query(
+    user,
+    `UPDATE timeline_entry
+     SET content = $2, url = $3, images = $4, structured = COALESCE($5, structured)
+     WHERE boost_of_uri = $1`,
+    [
+      noteUri,
+      fields.content,
+      fields.url,
+      fields.images == null ? null : JSON.stringify(fields.images),
+      fields.structured == null ? null : JSON.stringify(fields.structured),
+    ],
+  )
+  return result.rowCount ?? 0
+}
+
+/**
+ * Refresh a remote actor's cached presentation on every timeline row that shows
+ * them — as a post's AUTHOR and as the BOOSTER of a boost card — after an
+ * inbound `Update{Person}` (#1057). Returns how many rows changed. Only
+ * presentation columns move: which post a row is, and who delivered it, are
+ * untouched. The booster line carries no avatar, so only the two text columns
+ * exist to refresh there.
+ */
+export const updateTimelineActorPresentation = async (
+  user: string,
+  actorUri: string,
+  presentation: CachedActorPresentation,
+): Promise<number> => {
+  const author = await query(
+    user,
+    `UPDATE timeline_entry SET handle = $2, display_name = $3, avatar_url = $4
+     WHERE actor_uri = $1`,
+    [actorUri, presentation.handle, presentation.display_name, presentation.avatar_url],
+  )
+  const booster = await query(
+    user,
+    `UPDATE timeline_entry SET boosted_by_handle = $2, boosted_by_display_name = $3
+     WHERE boosted_by_actor_uri = $1`,
+    [actorUri, presentation.handle, presentation.display_name],
+  )
+  return (author.rowCount ?? 0) + (booster.rowCount ?? 0)
+}
+
 /** Reply visibility for a timeline page (from the `timeline_show_replies` setting). */
 export interface TimelineReplyFilter {
-  /** When false, replies to OTHER people's posts are excluded from the page. */
+  /**
+   * When false, replies to OTHER people's posts are excluded from the page. A
+   * BOOST card never counts as a reply: it inherits the boosted Note's
+   * `in_reply_to_uri`, but the card is the booster's boost, not their reply —
+   * Mastodon shows reblogs of replies either way.
+   */
   show_replies: boolean
   /**
    * URI prefix of the reader's OWN post objects (`{origin}/users/{me}/feed/`):
@@ -176,7 +251,8 @@ export const listTimelineEntries = async (
     user,
     `SELECT ${TIMELINE_COLUMNS} FROM timeline_entry
      WHERE ($1::timestamptz IS NULL OR (published_at, id) < ($1::timestamptz, $2::uuid))
-       AND ($4::boolean OR in_reply_to_uri IS NULL OR mentions_me OR in_reply_to_uri LIKE $5)
+       AND ($4::boolean OR in_reply_to_uri IS NULL OR boost_of_uri IS NOT NULL
+            OR mentions_me OR in_reply_to_uri LIKE $5)
      ORDER BY published_at DESC, id DESC
      LIMIT $3`,
     [
@@ -222,6 +298,10 @@ export const getTimelineEntryByObjectUri = async (
  * under one of the owner's own posts. These are ordinary timeline rows: any
  * actor's Note that replied to an existing own post is admitted on ingest
  * (#1060), so no network is involved in reading them back.
+ *
+ * Boost cards are excluded: a boost copies the announced Note's
+ * `in_reply_to_uri`, so a followee's boost of somebody's reply to this post
+ * would otherwise list that reply a second time, under the wrong byline.
  */
 export const listTimelineRepliesTo = async (
   user: string,
@@ -231,7 +311,7 @@ export const listTimelineRepliesTo = async (
   const result = await query<TimelineEntryRecord>(
     user,
     `SELECT ${TIMELINE_COLUMNS} FROM timeline_entry
-     WHERE in_reply_to_uri = $1
+     WHERE in_reply_to_uri = $1 AND boost_of_uri IS NULL
      ORDER BY published_at ASC, id ASC
      LIMIT $2`,
     [objectUri, limit],
@@ -248,7 +328,8 @@ export interface TimelineReplyCount {
 /**
  * Reply tallies for a whole page of the owner's posts — ONE grouped query, so
  * the feed listing never pays a count per post. Objects with no replies are
- * simply absent from the result.
+ * simply absent from the result. Boost cards are excluded, exactly as in
+ * {@link listTimelineRepliesTo}, so the count matches the list.
  */
 export const countTimelineRepliesTo = async (
   user: string,
@@ -258,7 +339,7 @@ export const countTimelineRepliesTo = async (
   const result = await query<TimelineReplyCount>(
     user,
     `SELECT in_reply_to_uri, count(*)::int AS count FROM timeline_entry
-     WHERE in_reply_to_uri = ANY($1::text[])
+     WHERE in_reply_to_uri = ANY($1::text[]) AND boost_of_uri IS NULL
      GROUP BY in_reply_to_uri`,
     [objectUris],
   )

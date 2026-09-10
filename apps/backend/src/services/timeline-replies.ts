@@ -25,7 +25,12 @@ import { fetchRemoteReplies } from './activitypub/remote-replies.ts'
 import { renderReplyContent } from './activitypub/reply-object.ts'
 import { loadReactionsForRows, ownActorUri, ownObjectPrefix, serializeTimelineEntry } from './timeline.ts'
 
-/** Newest-first cap on the comments listed under one of the owner's own posts. */
+/**
+ * Cap on the comments listed under one of the owner's own posts. The list is
+ * OLDEST-first (`listTimelineRepliesTo` orders by `published_at ASC`), so past
+ * this many comments it is the NEWEST that never load — pagination is the fix,
+ * and it isn't built yet.
+ */
 export const MAX_POST_REPLIES = 100
 
 /** The reader's own presentation on their replies, derived from the instance origin. */

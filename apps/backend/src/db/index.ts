@@ -9,6 +9,7 @@ export type {
   Activity,
   ActivityUpdate,
   BucketedMetricData,
+  CachedActorPresentation,
   CalendarConfig,
   DailyAggregate,
   DailyMetricAggregate,
@@ -293,6 +294,7 @@ export {
   removeFeedFollower,
   removeFeedFollowerById,
   setFeedFollowerAccepted,
+  updateFeedFollowerPresentation,
   upsertFeedFollower,
 } from './feed-follower.ts'
 
@@ -309,6 +311,7 @@ export {
   removeFeedFollowing,
   removeFeedFollowingByActor,
   updateFeedFollowingNotify,
+  updateFeedFollowingPresentation,
   upsertFeedFollowing,
 } from './feed-following.ts'
 
@@ -328,11 +331,13 @@ export {
   removeFeedPostReaction,
   removeFeedPostReactionByActivity,
   removeFeedReaction,
+  updateFeedPostReactionPresentation,
   upsertFeedPostReaction,
 } from './feed-reactions.ts'
 
 // Home timeline (posts received from followed actors)
 export {
+  type BoostedCopyFields,
   countTimelineRepliesTo,
   deleteBoostEntry,
   deleteTimelineEntriesByActor,
@@ -345,6 +350,7 @@ export {
   listUnenrichedAurbodaEntries,
   markEnrichTransientFailure,
   markTimelineEntryReplyChecked,
+  refreshBoostedCopies,
   setTimelineEntryReplyInfo,
   setTimelineEntryStructured,
   type TimelineCursor,
@@ -353,6 +359,7 @@ export {
   type TimelineReplyCount,
   type TimelineReplyFilter,
   type UnenrichedTimelineEntry,
+  updateTimelineActorPresentation,
   upsertTimelineEntry,
 } from './timeline.ts'
 export { emitTimelineNotify, openTimelineChannel } from './timeline-notify.ts'

@@ -15,6 +15,7 @@ import {
   removeFeedPostReaction,
   removeFeedPostReactionByActivity,
   removeFeedReaction,
+  updateFeedPostReactionPresentation,
   upsertFeedPostReaction,
 } from './feed-reactions.ts'
 import { createFeedPost, deleteFeedPost } from './feed.ts'
@@ -188,6 +189,47 @@ describe('Feed reaction stores integration', () => {
       // A post nobody reacted to is simply absent.
       expect(counts.filter((c) => c.post_id === second.id)).toEqual([])
       expect(await countFeedPostReactions(user, [])).toEqual([])
+    })
+
+    test('refreshes a reactor’s presentation across every post, from Update{Person} (#1057)', async () => {
+      const user = getTestUser()
+      const first = await post(user)
+      const second = await post(user)
+      await upsertFeedPostReaction(user, {
+        actor_uri: ALICE,
+        display_name: 'Alice',
+        handle: '@alice@mastodon.example',
+        kind: 'like',
+        post_id: first.id,
+      })
+      await upsertFeedPostReaction(user, {
+        actor_uri: ALICE,
+        display_name: 'Alice',
+        handle: '@alice@mastodon.example',
+        kind: 'announce',
+        post_id: second.id,
+      })
+      await upsertFeedPostReaction(user, {
+        actor_uri: BOB,
+        display_name: 'Bob',
+        handle: '@bob@remote.example',
+        kind: 'like',
+        post_id: first.id,
+      })
+
+      expect(
+        await updateFeedPostReactionPresentation(user, ALICE, {
+          avatar_url: null,
+          display_name: 'Alice Renamed',
+          handle: '@alice@mastodon.example',
+        }),
+      ).toBe(2)
+
+      const [onFirst] = await listFeedPostReactions(user, second.id, 100)
+      expect(onFirst.display_name).toBe('Alice Renamed')
+      // Somebody else's reaction on the same post is untouched.
+      const bobs = (await listFeedPostReactions(user, first.id, 100)).find((r) => r.actor_uri === BOB)
+      expect(bobs?.display_name).toBe('Bob')
     })
 
     test('deleting a post drops its reactions in the same statement', async () => {

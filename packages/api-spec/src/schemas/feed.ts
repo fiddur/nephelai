@@ -411,7 +411,9 @@ export const feedPostSchema = z
       .string()
       .optional()
       .meta({ description: 'The replied-to object id, present only for `reply` posts' }),
-    kind: feedPostKindSchema.meta({ description: 'Post kind (`activity` or `article`)' }),
+    kind: feedPostKindSchema.meta({
+      description: 'Post kind: `activity`, `article`, `challenge` or `reply`',
+    }),
     like_count: z.number().int().optional().meta({
       description: 'How many remote actors favourited (`Like`d) this post; absent on single-post responses',
     }),

@@ -12,6 +12,8 @@
  * `followers`-only posts. `id` is a stable local handle for the approve/reject
  * API (the actor_uri is unwieldy as a path param).
  */
+import type { CachedActorPresentation } from './types.ts'
+
 import { query } from './connection.ts'
 
 export interface FeedFollowerRecord {
@@ -78,6 +80,30 @@ export const upsertFeedFollower = async (
     ],
   )
   return result.rows[0]
+}
+
+/**
+ * Refresh a follower's cached presentation from an inbound `Update{Person}`
+ * (#1057) — the inbound mirror of the `Update{Person}` we deliver when our own
+ * profile changes. Returns whether such a follower existed.
+ *
+ * Presentation columns ONLY: the inbox URIs are delivery addressing, settled
+ * when the Follow arrived, and a profile edit has no business repointing where
+ * we deliver. The served actor document is authoritative here, so a removed
+ * avatar/display name really is cleared rather than COALESCEd away.
+ */
+export const updateFeedFollowerPresentation = async (
+  user: string,
+  actorUri: string,
+  presentation: CachedActorPresentation,
+): Promise<boolean> => {
+  const result = await query(
+    user,
+    `UPDATE feed_follower SET handle = $2, display_name = $3, avatar_url = $4
+     WHERE actor_uri = $1`,
+    [actorUri, presentation.handle, presentation.display_name, presentation.avatar_url],
+  )
+  return (result.rowCount ?? 0) > 0
 }
 
 /**

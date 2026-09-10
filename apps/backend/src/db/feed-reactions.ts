@@ -13,6 +13,8 @@
  */
 import type { FeedReactionKind } from '@aurboda/api-spec'
 
+import type { CachedActorPresentation } from './types.ts'
+
 import { query } from './connection.ts'
 
 export interface FeedReactionRecord {
@@ -208,6 +210,26 @@ export const removeFeedPostReactionByActivity = async (
     [activityUri, actorUri],
   )
   return (result.rowCount ?? 0) > 0
+}
+
+/**
+ * Refresh a reactor's cached presentation from an inbound `Update{Person}`
+ * (#1057), across every post of ours they reacted to. Returns how many rows
+ * changed. Presentation columns only — the reaction itself (which post, which
+ * kind, which activity) is untouched.
+ */
+export const updateFeedPostReactionPresentation = async (
+  user: string,
+  actorUri: string,
+  presentation: CachedActorPresentation,
+): Promise<number> => {
+  const result = await query(
+    user,
+    `UPDATE feed_post_reaction SET handle = $2, display_name = $3, avatar_url = $4
+     WHERE actor_uri = $1`,
+    [actorUri, presentation.handle, presentation.display_name, presentation.avatar_url],
+  )
+  return result.rowCount ?? 0
 }
 
 /** Who reacted to one of the user's posts, newest first (capped by `limit`). */

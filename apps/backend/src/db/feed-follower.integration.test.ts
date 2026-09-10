@@ -12,6 +12,7 @@ import {
   removeFeedFollower,
   removeFeedFollowerById,
   setFeedFollowerAccepted,
+  updateFeedFollowerPresentation,
   upsertFeedFollower,
 } from './feed-follower.ts'
 
@@ -148,5 +149,36 @@ describe('Feed followers integration', () => {
     expect(await removeFeedFollower(user, alice.actor_uri)).toBe(true)
     expect(await removeFeedFollower(user, alice.actor_uri)).toBe(false)
     expect(await listFeedFollowers(user)).toEqual([])
+  })
+
+  test('refreshes a follower’s presentation from an inbound Update{Person} (#1057)', async () => {
+    const user = getTestUser()
+    await upsertFeedFollower(user, { ...alice, accepted: true })
+
+    expect(
+      await updateFeedFollowerPresentation(user, alice.actor_uri, {
+        avatar_url: null,
+        display_name: 'Alice Renamed',
+        handle: '@alice@mastodon.example',
+      }),
+    ).toBe(true)
+
+    const row = await getFeedFollowerByActor(user, alice.actor_uri)
+    expect(row?.display_name).toBe('Alice Renamed')
+    // The served actor document is authoritative — a removed avatar really goes.
+    expect(row?.avatar_url).toBeNull()
+    // Delivery addressing and the acceptance state are untouched.
+    expect(row?.inbox_uri).toBe(alice.inbox_uri)
+    expect(row?.shared_inbox_uri).toBe(alice.shared_inbox_uri)
+    expect(row?.accepted).toBe(true)
+
+    // An actor we have no follower row for changes nothing.
+    expect(
+      await updateFeedFollowerPresentation(user, bob.actor_uri, {
+        avatar_url: null,
+        display_name: 'Bob',
+        handle: '@bob@remote.example',
+      }),
+    ).toBe(false)
   })
 })

@@ -4,8 +4,9 @@
  *
  * Like and boost are optimistic: the card flips at once and the patched entry is
  * written into every cached timeline page, so a later render agrees; a failure
- * rolls both back and shows the server's reason under the row. On success the
- * server's authoritative entry replaces the guess.
+ * rolls that one entry back (never the whole cache) and shows the server's
+ * reason under the row. On success the server's authoritative entry replaces the
+ * guess.
  *
  * A reply is NOT optimistic — it publishes a post that federates, so it waits
  * for the server and reports what actually happened.
@@ -126,13 +127,18 @@ export function TimelineActions({
   const toggle = (kind: 'boosted' | 'liked', on: boolean, request: () => Promise<TimelineEntry>) => {
     setError(null)
     setPosted(false)
-    const previous = queryClient.getQueryData<TimelinePages>(TIMELINE_KEY)
+    const before = current
     patch(withReaction(current, kind, on))
     request()
       .then(patch)
       .catch((cause: Error) => {
-        setShown(current)
-        queryClient.setQueryData<TimelinePages>(TIMELINE_KEY, previous)
+        setShown(before)
+        // Roll THIS entry back, never a whole-cache snapshot: pages fetched (and
+        // other cards toggled) while the request was in flight must survive the
+        // failure, and restoring an `undefined` snapshot would be ignored anyway.
+        queryClient.setQueryData<TimelinePages>(TIMELINE_KEY, (data) =>
+          patchTimelineEntry(data, entry.id, () => before),
+        )
         setError(cause.message)
       })
   }
