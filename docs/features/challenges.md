@@ -91,14 +91,27 @@ and surfaces it in standings.
 (MCP `discover_challenges`) walks the user's accepted ActivityPub followees. A followee
 whose actor id has the `<base>/users/<name>` shape is a _candidate_ Aurboda peer
 (Mastodon mints the same shape); `<base>/.well-known/aurboda` decides, remembered per
-instance for an hour so a Mastodon followee costs one probe, not one per page load. An
-Aurboda peer's public challenges are read from its public-profile listing (a followee on
-the same instance in-process); ended ones, anything the user hosts, joined or left, and
-any link that doesn't point into the host's own `/u/<name>/` space are dropped. The
+instance for an hour so a Mastodon followee costs one probe, not one per page load (and
+one probe per instance even on a cold round: concurrent followees share the in-flight
+one). Only a _definite_ answer is remembered — a 404 for the well-known document, a body
+that isn't Aurboda's, a refused private address. Anything that says nothing about the
+host (no answer at all, a 5xx, a 429 or 403, a DNS failure or a timeout) is transient:
+it is not cached, the peer is retried next round, and it is counted instead in
+`peers_unreachable`.
+
+An Aurboda peer's public challenges are read from its public-profile listing (a followee
+on the same instance in-process); ended ones, anything the user hosts, joined or left,
+and any link that doesn't point into the host's own `/u/<name>/` space are dropped.
+Leaving a challenge hard-deletes the participation row, so the "don't offer this again"
+fact is kept as a tombstone in `challenge_left`, keyed by the canonical challenge URL
+(query string and fragment dropped, trailing slashes trimmed, scheme and host
+lowercased — the same spelling a joined participation is stored under, so the same
+challenge pasted two ways is one challenge). Joining again clears the tombstone. The
 result is ongoing first (soonest to end), then upcoming, plus `peers_unreachable` — how
-many followed instances didn't answer this round. Unlisted challenges are not
-discoverable, by design; a peer from before the listing carried windows lists name +
-link only and is skipped rather than shown as "ongoing".
+many followed _instances_ didn't answer this round (three followees on one dead host
+count once). Unlisted challenges are not discoverable, by design; a peer from before the
+listing carried windows lists name + link only and is skipped rather than shown as
+"ongoing".
 
 ## Completion & winner announcement
 
