@@ -30,10 +30,28 @@ data class TimelineEntry(
     @SerialName("in_reply_to_mine") val inReplyToMine: Boolean = false,
     // A Mention of the reader — involvement, like a reply to their own post.
     @SerialName("mentions_me") val mentionsMe: Boolean = false,
+    // Set when this card is a BOOST: the author fields above describe the
+    // ORIGINAL post, this the followee who boosted it into the timeline.
+    @SerialName("boosted_by") val boostedBy: BoostedBy? = null,
 ) {
     /** Best available human name for the notification title. */
     val authorLabel: String get() = displayName ?: handle ?: actorUri
+
+    /**
+     * Whose presence in the timeline this post is owed to — the booster for a
+     * boost card, the author otherwise. This is the actor the notify-on-post
+     * setting applies to: you follow the booster, not (necessarily) the author.
+     */
+    val sourceActorUri: String get() = boostedBy?.actorUri ?: actorUri
 }
+
+/** The followee who boosted a post into the timeline (subset of `TimelineBoostedBy`). */
+@Serializable
+data class BoostedBy(
+    @SerialName("actor_uri") val actorUri: String,
+    val handle: String? = null,
+    @SerialName("display_name") val displayName: String? = null,
+)
 
 /** A page of the home timeline (subset of `TimelineResponse`). */
 @Serializable
@@ -106,7 +124,7 @@ fun decideNotifications(
         .filter { (entry, seenAt) ->
             val involved = entry.inReplyToMine || entry.mentionsMe
             seenAt.isAfter(highWater) &&
-                (involved || (entry.inReplyToUri == null && entry.actorUri in notifyActorUris))
+                (involved || (entry.inReplyToUri == null && entry.sourceActorUri in notifyActorUris))
         }
         .sortedBy { it.second }
         .map { it.first }

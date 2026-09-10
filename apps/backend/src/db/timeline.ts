@@ -31,6 +31,16 @@ export interface TimelineEntryRecord {
   structured: FeedStructuredPost | null
   /** Image attachments (rendered chart / route map, or a Mastodon photo), or null. */
   images: TimelineImage[] | null
+  /**
+   * On a BOOST card, the id of the original Note that was announced (this row's
+   * `object_uri` is the `Announce` activity id, and its author/content columns
+   * describe the original post). NULL on a direct entry.
+   */
+  boost_of_uri: string | null
+  /** On a boost card, the followee who boosted it. NULL on a direct entry. */
+  boosted_by_actor_uri: string | null
+  boosted_by_handle: string | null
+  boosted_by_display_name: string | null
 }
 
 export interface TimelineEntryInput {
@@ -51,6 +61,11 @@ export interface TimelineEntryInput {
   structured?: FeedStructuredPost | null
   /** Image attachments captured from the delivered Note, if any. */
   images?: TimelineImage[] | null
+  /** Set only for a BOOST card — the announced Note's id (see the record type). */
+  boost_of_uri?: string | null
+  boosted_by_actor_uri?: string | null
+  boosted_by_handle?: string | null
+  boosted_by_display_name?: string | null
 }
 
 /** Opaque keyset cursor: the last row's `(published_at, id)`. */
@@ -60,7 +75,7 @@ export interface TimelineCursor {
 }
 
 const TIMELINE_COLUMNS =
-  'id, object_uri, actor_uri, handle, display_name, avatar_url, content, url, published_at, received_at, in_reply_to_uri, mentions_me, structured, images'
+  'id, object_uri, actor_uri, handle, display_name, avatar_url, content, url, published_at, received_at, in_reply_to_uri, mentions_me, structured, images, boost_of_uri, boosted_by_actor_uri, boosted_by_handle, boosted_by_display_name'
 
 /**
  * Insert or update a received post by `object_uri`. A re-delivered or edited post
@@ -79,8 +94,9 @@ export const upsertTimelineEntry = async (
   const result = await query<TimelineEntryRecord & { inserted: boolean }>(
     user,
     `INSERT INTO timeline_entry
-       (object_uri, actor_uri, handle, display_name, avatar_url, content, url, published_at, in_reply_to_uri, mentions_me, reply_checked_at, structured, images)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), $11, $12)
+       (object_uri, actor_uri, handle, display_name, avatar_url, content, url, published_at, in_reply_to_uri, mentions_me, reply_checked_at, structured, images,
+        boost_of_uri, boosted_by_actor_uri, boosted_by_handle, boosted_by_display_name)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), $11, $12, $13, $14, $15, $16)
      ON CONFLICT (object_uri)
      DO UPDATE SET actor_uri = EXCLUDED.actor_uri,
                    handle = EXCLUDED.handle,
@@ -100,7 +116,13 @@ export const upsertTimelineEntry = async (
                    -- path, so this COALESCE never actually preserves a prior value
                    -- (an edit that drops attachments clears them) -- it is defensive
                    -- parity with structured for any caller that omits the field.
-                   images = COALESCE(EXCLUDED.images, timeline_entry.images)
+                   images = COALESCE(EXCLUDED.images, timeline_entry.images),
+                   -- A boost row's identity (which Note, boosted by whom) is
+                   -- fixed by its Announce id, so a redelivery just restates it.
+                   boost_of_uri = EXCLUDED.boost_of_uri,
+                   boosted_by_actor_uri = EXCLUDED.boosted_by_actor_uri,
+                   boosted_by_handle = EXCLUDED.boosted_by_handle,
+                   boosted_by_display_name = EXCLUDED.boosted_by_display_name
      RETURNING ${TIMELINE_COLUMNS}, (xmax = 0) AS inserted`,
     [
       input.object_uri,
@@ -115,6 +137,10 @@ export const upsertTimelineEntry = async (
       input.mentions_me ?? false,
       input.structured == null ? null : JSON.stringify(input.structured),
       input.images == null ? null : JSON.stringify(input.images),
+      input.boost_of_uri ?? null,
+      input.boosted_by_actor_uri ?? null,
+      input.boosted_by_handle ?? null,
+      input.boosted_by_display_name ?? null,
     ],
   )
   return result.rows[0]
@@ -174,6 +200,23 @@ export const getTimelineEntryById = async (user: string, id: string): Promise<Ti
   return result.rows[0] ?? null
 }
 
+/**
+ * One timeline entry by the remote object's id, or null. Backs the boost
+ * dedupe: an announced Note that is ALREADY a direct entry gets no boost card
+ * (Mastodon hides a reblog of a post already in the feed).
+ */
+export const getTimelineEntryByObjectUri = async (
+  user: string,
+  objectUri: string,
+): Promise<TimelineEntryRecord | null> => {
+  const result = await query<TimelineEntryRecord>(
+    user,
+    `SELECT ${TIMELINE_COLUMNS} FROM timeline_entry WHERE object_uri = $1`,
+    [objectUri],
+  )
+  return result.rows[0] ?? null
+}
+
 /** A legacy entry whose reply/Mention state is unknown (pre-#1060 ingest). */
 export interface ReplyUncheckedEntry {
   id: string
@@ -226,25 +269,57 @@ export const markTimelineEntryReplyChecked = async (user: string, id: string): P
  * to the actor that authored it. The `actor_uri` guard is an authorization check:
  * an inbound `Delete` is only signed by *some* actor, so without it any actor
  * could evict another author's post from the timeline by its (guessable) id.
+ *
+ * Boost cards of that Note go with it: a boost row's `actor_uri` is the ORIGINAL
+ * author (the row renders their post), so the same authorization scope covers
+ * both — the author deleting their post retracts every followee's boost of it,
+ * and nobody else's `Delete` touches either.
  */
 export const deleteTimelineEntryByUri = async (
   user: string,
   objectUri: string,
   actorUri: string,
 ): Promise<boolean> => {
-  const result = await query(user, `DELETE FROM timeline_entry WHERE object_uri = $1 AND actor_uri = $2`, [
-    objectUri,
-    actorUri,
-  ])
+  const result = await query(
+    user,
+    `DELETE FROM timeline_entry WHERE actor_uri = $2 AND (object_uri = $1 OR boost_of_uri = $1)`,
+    [objectUri, actorUri],
+  )
   return (result.rowCount ?? 0) > 0
 }
 
 /**
- * Remove every received post authored by an actor (on `Undo{Follow}`/unfollow, so
- * an unfollowed actor's posts leave the timeline).
+ * Remove one boost card by its `Announce` id, scoped to the booster — the
+ * inbound `Undo{Announce}` path. Never touches the original post's own entry
+ * (which is keyed on the Note id, not the Announce id).
+ */
+export const deleteBoostEntry = async (
+  user: string,
+  announceUri: string,
+  boosterActorUri: string,
+): Promise<boolean> => {
+  const result = await query(
+    user,
+    `DELETE FROM timeline_entry WHERE object_uri = $1 AND boosted_by_actor_uri = $2`,
+    [announceUri, boosterActorUri],
+  )
+  return (result.rowCount ?? 0) > 0
+}
+
+/**
+ * Remove every timeline row that exists *because of* an actor, on
+ * `Undo{Follow}`/unfollow: their own posts (direct entries they authored) and
+ * every post they boosted into the timeline. Someone ELSE's boost of one of
+ * their posts stays — it's in the timeline on the booster's account, and that
+ * follow is untouched.
  */
 export const deleteTimelineEntriesByActor = async (user: string, actorUri: string): Promise<number> => {
-  const result = await query(user, `DELETE FROM timeline_entry WHERE actor_uri = $1`, [actorUri])
+  const result = await query(
+    user,
+    `DELETE FROM timeline_entry
+     WHERE (actor_uri = $1 AND boost_of_uri IS NULL) OR boosted_by_actor_uri = $1`,
+    [actorUri],
+  )
   return result.rowCount ?? 0
 }
 

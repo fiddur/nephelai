@@ -311,11 +311,32 @@ export {
   upsertFeedFollowing,
 } from './feed-following.ts'
 
+// Likes ⭐ / boosts 🔄 (outbound `feed_reaction`, inbound `feed_post_reaction`)
+export {
+  countFeedPostReactions,
+  type FeedPostReactionCount,
+  type FeedPostReactionInput,
+  type FeedPostReactionRecord,
+  type FeedReactionInput,
+  type FeedReactionRecord,
+  type FeedReactionState,
+  getFeedReaction,
+  insertFeedReaction,
+  listFeedPostReactions,
+  listFeedReactionsForObjects,
+  removeFeedPostReaction,
+  removeFeedPostReactionByActivity,
+  removeFeedReaction,
+  upsertFeedPostReaction,
+} from './feed-reactions.ts'
+
 // Home timeline (posts received from followed actors)
 export {
+  deleteBoostEntry,
   deleteTimelineEntriesByActor,
   deleteTimelineEntryByUri,
   getTimelineEntryById,
+  getTimelineEntryByObjectUri,
   listReplyUncheckedEntries,
   listTimelineEntries,
   listUnenrichedAurbodaEntries,

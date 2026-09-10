@@ -14,6 +14,7 @@ import type { CentralDb } from '../services/central-db.ts'
 import type { DiscoverChallenges } from '../services/challenge-discovery.ts'
 import type { DeductionEngineDeps } from '../services/deduction-engine.ts'
 import type { ActivityNotifier, DeductionQueue } from '../services/deduction-queue.ts'
+import type { ReactionActions } from '../services/feed-reactions.ts'
 import type { FollowerActions } from '../services/followers.ts'
 import type { FollowActions } from '../services/following.ts'
 import type { InvitationAuth } from '../services/invitation.ts'
@@ -101,6 +102,8 @@ interface RestRoutesDeps {
   feedDeliver: FeedDeliver
   followActions: FollowActions
   followerActions: FollowerActions
+  /** Outbound like ⭐ / boost 🔄 toggles for the home timeline. */
+  reactionActions: ReactionActions
   timelineHub: TimelineHub
   retroEnrichTimeline: RetroEnrichTrigger
   /** Fire-and-forget: federate an `Update{Person}` after an avatar change. */
@@ -131,6 +134,7 @@ export const mountRestRouters = ({
   feedDeliver,
   followActions,
   followerActions,
+  reactionActions,
   onAvatarChanged,
   retroEnrichTimeline,
   timelineHub,
@@ -183,7 +187,15 @@ export const mountRestRouters = ({
   httpd.use('/feed/followers', createFeedFollowersRouter(authMiddleware, followerActions))
   httpd.use(
     '/feed',
-    createFeedRouter(authMiddleware, feedDeliver, timelineHub, apiBaseUrl, retroEnrichTimeline, webHost),
+    createFeedRouter(
+      authMiddleware,
+      feedDeliver,
+      timelineHub,
+      apiBaseUrl,
+      retroEnrichTimeline,
+      webHost,
+      reactionActions,
+    ),
   )
   httpd.use('/challenges', createChallengesRouter(authMiddleware, webHost, apiBaseUrl, discoverChallenges))
   httpd.use(createChallengeDataRouter())

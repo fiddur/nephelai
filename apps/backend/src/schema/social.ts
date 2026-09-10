@@ -369,6 +369,18 @@ export const socialTables: Record<string, string> = {
     UPDATE timeline_entry SET reply_checked_at = NOW()
     WHERE reply_checked_at IS NULL AND in_reply_to_uri IS NOT NULL
   `,
+  // A boost card: an `Announce` by a followee of a THIRD-PARTY post. The row's
+  // author/content/images/structured columns describe the ORIGINAL post (so the
+  // card renders it), `object_uri` is the *Announce activity* id (globally
+  // unique, so two followees boosting the same post give two cards and a boost
+  // never collides with a direct entry), `boost_of_uri` the announced Note's id,
+  // and `boosted_by_*` the followee who boosted. NULL on a direct entry.
+  timeline_entry_boost: `
+    ALTER TABLE timeline_entry ADD COLUMN IF NOT EXISTS boost_of_uri TEXT;
+    ALTER TABLE timeline_entry ADD COLUMN IF NOT EXISTS boosted_by_actor_uri TEXT;
+    ALTER TABLE timeline_entry ADD COLUMN IF NOT EXISTS boosted_by_handle TEXT;
+    ALTER TABLE timeline_entry ADD COLUMN IF NOT EXISTS boosted_by_display_name TEXT;
+  `,
   // Timeline ordering / keyset pagination is by (published_at DESC, id DESC).
   timeline_entry_indexes: `
     CREATE INDEX IF NOT EXISTS idx_timeline_entry_published
@@ -381,6 +393,51 @@ export const socialTables: Record<string, string> = {
     CREATE INDEX IF NOT EXISTS idx_timeline_entry_unenriched
       ON timeline_entry (published_at DESC, id DESC)
       WHERE structured IS NULL AND enrich_attempted_at IS NULL
+  `,
+
+  // The user's OWN outbound reactions: a `Like` (favourite) or `Announce`
+  // (boost) they sent for a post — remote or local. `id` mints the AS2 activity
+  // id (`{origin}/users/{user}/{likes,announces}/{id}`, `#undo` for the
+  // retraction), so an `Undo` always references exactly the activity that was
+  // delivered. The reacted-to Note's author + their inbox are cached so the Undo
+  // needs no actor re-resolve. UNIQUE (kind, object_uri) makes reacting
+  // idempotent — a second Like of the same post is a no-op, never a second
+  // delivery.
+  feed_reaction: `
+    CREATE TABLE IF NOT EXISTS feed_reaction (
+      id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      kind             VARCHAR(8) NOT NULL,
+      object_uri       TEXT NOT NULL,
+      actor_uri        TEXT NOT NULL,
+      inbox_uri        TEXT NOT NULL,
+      shared_inbox_uri TEXT,
+      created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (kind, object_uri)
+    )
+  `,
+
+  // Inbound reactions on the user's OWN feed posts: who liked / boosted each
+  // post. `post_id` is a soft reference to feed_posts (like `activity_id` —
+  // deleting a post drops these rows in the same statement). `activity_uri` is
+  // the remote Like/Announce's own id, so an `Undo` carrying only a bare
+  // activity URI still matches. One row per (post, kind, actor) — a redelivered
+  // Like refreshes the presentation snapshot instead of duplicating.
+  feed_post_reaction: `
+    CREATE TABLE IF NOT EXISTS feed_post_reaction (
+      post_id       UUID NOT NULL,
+      kind          VARCHAR(8) NOT NULL,
+      actor_uri     TEXT NOT NULL,
+      activity_uri  TEXT,
+      handle        TEXT,
+      display_name  TEXT,
+      avatar_url    TEXT,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (post_id, kind, actor_uri)
+    )
+  `,
+  feed_post_reaction_indexes: `
+    CREATE INDEX IF NOT EXISTS idx_feed_post_reaction_post
+      ON feed_post_reaction (post_id, created_at DESC)
   `,
 
   // The user's public profile avatar. One per user (the profile owner), so a

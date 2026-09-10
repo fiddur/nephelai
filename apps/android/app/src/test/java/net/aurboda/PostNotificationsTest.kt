@@ -16,6 +16,7 @@ class PostNotificationsTest {
         inReplyToUri: String? = null,
         inReplyToMine: Boolean = false,
         mentionsMe: Boolean = false,
+        boostedBy: BoostedBy? = null,
     ) =
         TimelineEntry(
             objectUri = objectUri,
@@ -25,6 +26,7 @@ class PostNotificationsTest {
             inReplyToUri = inReplyToUri,
             inReplyToMine = inReplyToMine,
             mentionsMe = mentionsMe,
+            boostedBy = boostedBy,
         )
 
     private val alice = "https://mastodon.example/users/alice"
@@ -107,6 +109,31 @@ class PostNotificationsTest {
         )
         val decision = decideNotifications(entries, notifyActorUris = setOf(alice), highWater = hw)
         assertEquals(listOf("stranger-reply", "stranger-mention"), decision.toNotify.map { it.objectUri })
+    }
+
+    @Test
+    fun `a boost notifies on the BOOSTER, not the boosted post's author`() {
+        val hw = Instant.parse("2026-07-15T10:00:00Z")
+        val carol = "https://third.example/users/carol"
+        val entries = listOf(
+            // Alice (followed, notify on) boosted Carol's post — Carol isn't
+            // followed at all, but the boost is in the timeline because of Alice.
+            entry(
+                "boost-by-alice",
+                carol,
+                "2026-07-15T10:10:00Z",
+                boostedBy = BoostedBy(actorUri = alice, handle = "@alice@mastodon.example"),
+            ),
+            // Bob is muted, so his boost stays silent even though Carol isn't.
+            entry(
+                "boost-by-bob",
+                carol,
+                "2026-07-15T10:20:00Z",
+                boostedBy = BoostedBy(actorUri = bob),
+            ),
+        )
+        val decision = decideNotifications(entries, notifyActorUris = setOf(alice), highWater = hw)
+        assertEquals(listOf("boost-by-alice"), decision.toNotify.map { it.objectUri })
     }
 
     @Test

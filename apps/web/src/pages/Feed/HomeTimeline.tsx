@@ -13,11 +13,24 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tansta
 import { formatDistanceToNow } from 'date-fns'
 import { useState } from 'preact/hooks'
 
-import { fetchTimeline, fetchTimelineReplies, fetchUserSettings, updateUserSettings } from '../../state/api'
+import {
+  boostTimelineEntry,
+  fetchTimeline,
+  fetchTimelineReplies,
+  fetchUserSettings,
+  likeTimelineEntry,
+  unboostTimelineEntry,
+  unlikeTimelineEntry,
+  updateUserSettings,
+} from '../../state/api'
 import { ActorName } from './ActorName'
+import { patchTimelineEntry, type TimelinePages, withReaction } from './timeline-actions'
 import { timelineImageVisible } from './timeline-structured'
 import { TimelineStructured } from './TimelineStructured'
 import { useTimelineLive } from './useTimelineLive'
+
+/** The infinite-query key every timeline page (and every optimistic patch) lives under. */
+const TIMELINE_KEY = ['feed', 'timeline'] as const
 
 /** De-duplicate entries by `object_uri`, keeping the first (newest) occurrence. */
 const dedupByUri = (list: TimelineEntry[]): TimelineEntry[] => {
@@ -46,8 +59,20 @@ const FALLBACK_AVATAR =
 function TimelineCard({ entry }: { entry: TimelineEntry }) {
   const when = formatDistanceToNow(new Date(entry.published_at), { addSuffix: true })
   const name = entry.display_name ?? entry.handle ?? entry.actor_uri
+  const booster = entry.boosted_by
   return (
     <article class="feed-post">
+      {/* Mastodon's "🔄 X boosted" line: the card below is the ORIGINAL post. */}
+      {booster && (
+        <p class="feed-post-boost-marker">
+          🔄{' '}
+          <ActorName
+            name={booster.display_name ?? booster.handle ?? booster.actor_uri}
+            actorUri={booster.actor_uri}
+          />{' '}
+          boosted
+        </p>
+      )}
       <header class="feed-post-head">
         <img
           class="feed-post-avatar"
@@ -109,8 +134,85 @@ function TimelineCard({ entry }: { entry: TimelineEntry }) {
           />
         ))}
 
+      <TimelineActions entry={entry} />
+
       <TimelineReplies entryId={entry.id} />
     </article>
+  )
+}
+
+/**
+ * The ⭐ / 🔄 row. Both toggles are optimistic: the card flips at once and the
+ * patched entry is written into every cached timeline page, so a later render
+ * agrees; a failure rolls both back and shows the server's reason under the row.
+ * On success the server's authoritative entry replaces the guess.
+ *
+ * The local `shown` state is what the buttons read, because a card revealed from
+ * the "N new posts" pill isn't in the query cache yet — patching alone would
+ * leave those buttons frozen.
+ */
+function TimelineActions({ entry }: { entry: TimelineEntry }) {
+  const queryClient = useQueryClient()
+  const [shown, setShown] = useState<TimelineEntry | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const current = shown ?? entry
+
+  const patch = (next: TimelineEntry) => {
+    setShown(next)
+    queryClient.setQueryData<TimelinePages>(TIMELINE_KEY, (data) =>
+      patchTimelineEntry(data, entry.id, () => next),
+    )
+  }
+
+  const toggle = (kind: 'boosted' | 'liked', on: boolean, request: () => Promise<TimelineEntry>) => {
+    setError(null)
+    const previous = queryClient.getQueryData<TimelinePages>(TIMELINE_KEY)
+    patch(withReaction(current, kind, on))
+    request()
+      .then(patch)
+      .catch((cause: Error) => {
+        setShown(current)
+        queryClient.setQueryData<TimelinePages>(TIMELINE_KEY, previous)
+        setError(cause.message)
+      })
+  }
+
+  const liked = current.liked === true
+  const boosted = current.boosted === true
+  return (
+    <>
+      <div class="feed-post-actions">
+        <button
+          type="button"
+          class={`feed-post-action${liked ? ' active' : ''}`}
+          aria-pressed={liked}
+          aria-label={liked ? 'Unfavourite' : 'Favourite'}
+          title={liked ? 'Unfavourite' : 'Favourite'}
+          onClick={() =>
+            toggle('liked', !liked, () =>
+              liked ? unlikeTimelineEntry(entry.id) : likeTimelineEntry(entry.id),
+            )
+          }
+        >
+          ⭐
+        </button>
+        <button
+          type="button"
+          class={`feed-post-action feed-post-action--boost${boosted ? ' active' : ''}`}
+          aria-pressed={boosted}
+          aria-label={boosted ? 'Unboost' : 'Boost'}
+          title={boosted ? 'Unboost' : 'Boost'}
+          onClick={() =>
+            toggle('boosted', !boosted, () =>
+              boosted ? unboostTimelineEntry(entry.id) : boostTimelineEntry(entry.id),
+            )
+          }
+        >
+          🔄
+        </button>
+      </div>
+      {error && <p class="feed-error feed-post-action-error">{error}</p>}
+    </>
   )
 }
 
@@ -218,7 +320,7 @@ export function HomeTimeline() {
     getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
     initialPageParam: undefined,
     queryFn: ({ pageParam }) => fetchTimeline(pageParam),
-    queryKey: ['feed', 'timeline'],
+    queryKey: TIMELINE_KEY,
   })
 
   const entries = data?.pages.flatMap((page) => page.entries) ?? []

@@ -107,6 +107,7 @@ import {
 } from './services/deduction-queue.ts'
 import { createDetectionTrigger, type DetectionTrigger } from './services/detection-trigger.ts'
 import { runDetectionForUser } from './services/detection-worker.ts'
+import { createReactionActions } from './services/feed-reactions.ts'
 import { expandFeedActivityWindow, resolveFeedActivity } from './services/feed.ts'
 import {
   approveFollower,
@@ -596,6 +597,9 @@ const main = async () => {
     follow: (user, handle) => followActor(feedDeps, user, handle),
     unfollow: (user, id) => unfollowActor(feedDeps, user, id),
   }
+  // Outbound likes ⭐ / boosts 🔄 on the home timeline, on the same federation +
+  // origin, shared by the REST feed router and the MCP reaction tools.
+  const reactionActions = createReactionActions(feedDeps)
   // The follower-management operations (approve/reject a follow request), sharing
   // the same federation + origin. Approve returns the serialised follower.
   const followerActions: FollowerActions = {
@@ -628,6 +632,7 @@ const main = async () => {
       gravl,
       onActivityMutated: activityNotifier,
       oura,
+      reactionActions,
       retroEnrichTimeline,
       stravaQueue: stravaQueue ?? undefined,
       sync: syncProvider,
@@ -785,6 +790,7 @@ const main = async () => {
       )
     },
     ouraWebhookManager,
+    reactionActions,
     retroEnrichTimeline,
     syncProvider,
     timelineHub,

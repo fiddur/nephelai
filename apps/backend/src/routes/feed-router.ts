@@ -13,6 +13,7 @@ import {
   type BaseResponse,
   type CreateArticleBody,
   createArticleBodySchema,
+  type FeedPostReactionsResponse,
   type FeedPostResponse,
   type FeedPostsQuery,
   feedPostsQuerySchema,
@@ -22,6 +23,7 @@ import {
   type SharePreviewResponse,
   type ShareChallengeBody,
   shareChallengeBodySchema,
+  type TimelineEntryResponse,
   type TimelineQuery,
   timelineQuerySchema,
   type TimelineRepliesResponse,
@@ -33,6 +35,7 @@ import {
 } from '@aurboda/api-spec'
 
 import type { Activity, FeedPostRecord } from '../db/index.ts'
+import type { ReactionActions, ReactionResult } from '../services/feed-reactions.ts'
 import type { TimelineHub } from '../services/timeline-hub.ts'
 import type { RetroEnrichTrigger } from '../services/timeline-retro-enrich.ts'
 
@@ -44,6 +47,7 @@ import {
   getActivityById,
   getFeedPostById,
   getTimelineEntryById,
+  listFeedPostReactions,
   updateFeedPost,
 } from '../db/index.ts'
 import { isPubliclyVisible } from '../services/activitypub/object.ts'
@@ -51,6 +55,7 @@ import { fetchRemoteReplies } from '../services/activitypub/remote-replies.ts'
 import { buildArticleMarkdown, renderableArticleBlocks } from '../services/article-export.ts'
 import { buildArticleContent, mergeArticleContent } from '../services/article.ts'
 import { resolveChallengeShare } from '../services/challenge-share.ts'
+import { serializeFeedPostReaction } from '../services/feed-reactions.ts'
 import {
   getFeedPage,
   normalizeFeedMessage,
@@ -96,6 +101,18 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 /** Total budget for one reply-thread snapshot (object + collection + authors). */
 const REPLIES_TIMEOUT_MS = 12_000
 
+/** Newest-first cap on the "who liked / boosted this" list. */
+const MAX_POST_REACTIONS = 100
+
+/**
+ * Map a reaction toggle's outcome to its HTTP status + body. Pure, so the four
+ * toggle routes below stay one-liners that differ only in which action they call.
+ */
+const reactionResponse = (result: ReactionResult): { status: number; body: TimelineEntryResponse } =>
+  result.ok
+    ? { body: { entry: result.entry, success: true }, status: 200 }
+    : { body: { error: result.error, success: false }, status: result.status }
+
 export const createFeedRouter = (
   authMiddleware: AnyMiddleware,
   deliver?: FeedDeliver,
@@ -104,6 +121,8 @@ export const createFeedRouter = (
   retroEnrichTimeline?: RetroEnrichTrigger,
   /** Canonical web origin, to build a shared challenge's public URL (#994). */
   webHost?: string,
+  /** Outbound like ⭐ / boost 🔄 toggles; absent → those routes answer 503. */
+  reactions?: ReactionActions,
 ): TypedRouter => {
   const router = typedRouter()
 
@@ -207,6 +226,73 @@ export const createFeedRouter = (
       ).catch(() => ({ partial: true, replies: [] }))
       res.setHeader('Cache-Control', 'no-store')
       res.json({ partial, replies, success: true })
+    },
+  )
+
+  // Like ⭐ / boost 🔄 one home-timeline post, addressed by the entry's LOCAL id
+  // (what the card has). All four are idempotent: a repeat POST returns the entry
+  // unchanged and delivers nothing, a DELETE of a reaction that isn't there is a
+  // no-op. Registered before the generic `/:postId` routes.
+  router.post<{ id: string }, TimelineEntryResponse>(
+    '/timeline/:id/like',
+    authMiddleware,
+    async (req, res) => {
+      if (!reactions) return res.status(503).json({ error: 'Reactions are not available', success: false })
+      if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Not found', success: false })
+      const { body, status } = reactionResponse(await reactions.like(req.user!, req.params.id))
+      res.status(status).json(body)
+    },
+  )
+
+  router.delete<{ id: string }, TimelineEntryResponse>(
+    '/timeline/:id/like',
+    authMiddleware,
+    async (req, res) => {
+      if (!reactions) return res.status(503).json({ error: 'Reactions are not available', success: false })
+      if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Not found', success: false })
+      const { body, status } = reactionResponse(await reactions.unlike(req.user!, req.params.id))
+      res.status(status).json(body)
+    },
+  )
+
+  router.post<{ id: string }, TimelineEntryResponse>(
+    '/timeline/:id/boost',
+    authMiddleware,
+    async (req, res) => {
+      if (!reactions) return res.status(503).json({ error: 'Reactions are not available', success: false })
+      if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Not found', success: false })
+      const { body, status } = reactionResponse(await reactions.boost(req.user!, req.params.id))
+      res.status(status).json(body)
+    },
+  )
+
+  router.delete<{ id: string }, TimelineEntryResponse>(
+    '/timeline/:id/boost',
+    authMiddleware,
+    async (req, res) => {
+      if (!reactions) return res.status(503).json({ error: 'Reactions are not available', success: false })
+      if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Not found', success: false })
+      const { body, status } = reactionResponse(await reactions.unboost(req.user!, req.params.id))
+      res.status(status).json(body)
+    },
+  )
+
+  // Who liked / boosted one of the owner's OWN posts (newest first). Registered
+  // before the generic `/:postId` routes so `reactions` is never read as a verb
+  // on a post id.
+  router.get<{ postId: string }, FeedPostReactionsResponse>(
+    '/:postId/reactions',
+    authMiddleware,
+    async (req, res) => {
+      const user = req.user!
+      if (!UUID_RE.test(req.params.postId)) {
+        return res.status(404).json({ error: 'Feed post not found', reactions: [], success: false })
+      }
+      if ((await getFeedPostById(user, req.params.postId)) == null) {
+        return res.status(404).json({ error: 'Feed post not found', reactions: [], success: false })
+      }
+      const rows = await listFeedPostReactions(user, req.params.postId, MAX_POST_REACTIONS)
+      res.json({ reactions: rows.map(serializeFeedPostReaction), success: true })
     },
   )
 
