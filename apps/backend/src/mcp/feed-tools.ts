@@ -9,6 +9,7 @@ import {
   shareChallengeBodySchema,
   followActorBodySchema,
   followersQuerySchema,
+  replyToPostBodySchema,
   shareActivityBodySchema,
   timelineQuerySchema,
   updateArticleBodySchema,
@@ -18,7 +19,7 @@ import {
 import { z } from 'zod'
 
 import type { FeedDeliver } from '../routes/feed-router.ts'
-import type { ReactionActions, ReactionResult } from '../services/feed-reactions.ts'
+import type { ReactionActions, ReactionResult, ReplyResult } from '../services/feed-reactions.ts'
 import type { FollowerActions } from '../services/followers.ts'
 import type { FollowActions } from '../services/following.ts'
 import type { RetroEnrichTrigger } from '../services/timeline-retro-enrich.ts'
@@ -38,7 +39,7 @@ import {
   updateFeedPost,
 } from '../db/index.ts'
 import { isPubliclyVisible } from '../services/activitypub/object.ts'
-import { fetchRemoteReplies } from '../services/activitypub/remote-replies.ts'
+import { REPLIES_TIMEOUT_MS } from '../services/activitypub/remote-replies.ts'
 import { buildArticleMarkdown, renderableArticleBlocks } from '../services/article-export.ts'
 import { buildArticleContent, mergeArticleContent } from '../services/article.ts'
 import { resolveChallengeShare } from '../services/challenge-share.ts'
@@ -52,7 +53,8 @@ import {
 import { serializeFollower } from '../services/followers.ts'
 import { serializeFollowing } from '../services/following.ts'
 import { getSettings } from '../services/settings.ts'
-import { getTimelinePage } from '../services/timeline.ts'
+import { getThreadSnapshot, listOwnPostReplies, MAX_POST_REPLIES } from '../services/timeline-replies.ts'
+import { getTimelinePage, reactionTarget } from '../services/timeline.ts'
 import { withTimeout } from '../services/with-timeout.ts'
 import { errorResponse, jsonResponse, type McpServer } from './helpers.ts'
 
@@ -71,7 +73,7 @@ export interface FeedToolsOptions {
   deliver?: FeedDeliver
   followActions?: FollowActions
   followerActions?: FollowerActions
-  /** Outbound like ⭐ / boost 🔄 toggles; absent → those tools report unavailable. */
+  /** Outbound like ⭐ / boost 🔄 / reply 🗨 actions; absent → those tools report unavailable. */
   reactionActions?: ReactionActions
   apiBaseUrl?: string
   retroEnrichTimeline?: RetroEnrichTrigger
@@ -93,13 +95,16 @@ export const registerFeedTools = (server: McpServer, user: string, options: Feed
   /** Answer a reaction toggle with the updated entry, or the failure as a tool error. */
   const reactionResult = (result: ReactionResult) =>
     result.ok ? jsonResponse(result.entry) : errorResponse(result.error)
+  /** Answer a reply with the created post, or the failure as a tool error. */
+  const replyResult = (result: ReplyResult) =>
+    result.ok ? jsonResponse(result.post) : errorResponse(result.error)
   server.tool(
     'list_feed',
     "List posts you have published to your feed, newest first, with their shared metric selection, series opt-in, and visibility. Pass `cursor` (from a previous call's `next_cursor`) to page.",
     { ...feedPostsQuerySchema.shape },
     async ({ cursor, limit }) => {
       const settings = await getSettings(user).catch(() => null)
-      return jsonResponse(await getFeedPage(user, limit, cursor, { settings }))
+      return jsonResponse(await getFeedPage(user, limit, cursor, { origin: webHost, settings }))
     },
   )
 
@@ -160,6 +165,7 @@ export const registerFeedTools = (server: McpServer, user: string, options: Feed
       // their own paths — the generic `updated` would silently no-op.
       if (record.kind === 'article') deliver?.updatedArticle(user, record)
       else if (record.kind === 'challenge') deliver?.updatedChallenge(user, record)
+      else if (record.kind === 'reply') deliver?.updatedReply(user, record)
       else deliver?.updated(user, record)
       return jsonResponse(await serializeFeedPost(user, record))
     },
@@ -285,16 +291,43 @@ export const registerFeedTools = (server: McpServer, user: string, options: Feed
 
   server.tool(
     'get_timeline_replies',
-    "Fetch a live, bounded snapshot of the replies to one home-timeline post (by the entry's local `id`) from its origin server. `partial: true` means the fetch budget ran out before the thread did.",
+    "Fetch a bounded snapshot of the replies to one home-timeline post (by the entry's local `id`) from its origin server, with YOUR OWN replies to the same post merged in (`mine: true`). `partial: true` means the fetch budget ran out before the thread did; `fetched: false` means the origin's thread could not be read at all — an empty list then means unknown, not empty.",
     { id: z.string().uuid() },
     async ({ id }) => {
       const entry = await getTimelineEntryById(user, id)
-      if (entry == null) return jsonResponse({ error: 'Not found', success: false })
-      const result = await withTimeout(fetchRemoteReplies(entry.object_uri), 12_000).catch(() => ({
-        partial: true,
-        replies: [],
-      }))
-      return jsonResponse({ ...result, success: true })
+      if (entry == null) return errorResponse('Not found')
+      if (!webHost) return errorResponse('Replies are not available')
+      // A boost card stands for the ORIGINAL Note — the same target a like or a
+      // reply resolves.
+      const result = await withTimeout(
+        getThreadSnapshot(user, webHost, reactionTarget(entry)),
+        REPLIES_TIMEOUT_MS,
+      ).catch(() => ({ fetched: false, partial: true, replies: [] }))
+      return jsonResponse(result)
+    },
+  )
+
+  server.tool(
+    'reply_to_timeline_post',
+    "Reply 🗨 to a post in your home timeline, by the entry's local `id` from `list_timeline`. Publishes a reply post (an AS2 `Create{Note}` with `inReplyTo` and a `Mention` of the author) delivered to your followers AND the author's inbox. `visibility` defaults to `unlisted`, the Mastodon convention for replies. Returns the created feed post.",
+    {
+      id: z.string().uuid().describe('Home-timeline entry id (the `id` from list_timeline)'),
+      ...replyToPostBodySchema.shape,
+    },
+    async ({ id, ...body }) => {
+      if (!reactionActions) return errorResponse('Replies are not available')
+      return replyResult(await reactionActions.reply(user, id, body))
+    },
+  )
+
+  server.tool(
+    'get_feed_post_replies',
+    'List the comments this instance holds under one of YOUR feed posts (by feed post id), oldest first. These are the replies remote actors delivered to you — no network fetch. Each is a full timeline entry, so it carries your like/boost state and can itself be replied to with `reply_to_timeline_post`.',
+    { id: z.string().uuid().describe('Feed post ID') },
+    async ({ id }) => {
+      if (!webHost) return errorResponse('Replies are not available')
+      if ((await getFeedPostById(user, id)) == null) return errorResponse('Feed post not found')
+      return jsonResponse(await listOwnPostReplies(user, webHost, id, MAX_POST_REPLIES))
     },
   )
 

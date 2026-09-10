@@ -14,10 +14,13 @@ import {
   type CreateArticleBody,
   createArticleBodySchema,
   type FeedPostReactionsResponse,
+  type FeedPostRepliesResponse,
   type FeedPostResponse,
   type FeedPostsQuery,
   feedPostsQuerySchema,
   type FeedPostsResponse,
+  type ReplyToPostBody,
+  replyToPostBodySchema,
   type ShareActivityBody,
   shareActivityBodySchema,
   type SharePreviewResponse,
@@ -51,7 +54,7 @@ import {
   updateFeedPost,
 } from '../db/index.ts'
 import { isPubliclyVisible } from '../services/activitypub/object.ts'
-import { fetchRemoteReplies } from '../services/activitypub/remote-replies.ts'
+import { REPLIES_TIMEOUT_MS } from '../services/activitypub/remote-replies.ts'
 import { buildArticleMarkdown, renderableArticleBlocks } from '../services/article-export.ts'
 import { buildArticleContent, mergeArticleContent } from '../services/article.ts'
 import { resolveChallengeShare } from '../services/challenge-share.ts'
@@ -63,7 +66,8 @@ import {
   serializeFeedPost,
 } from '../services/feed.ts'
 import { getSettings } from '../services/settings.ts'
-import { getTimelinePage } from '../services/timeline.ts'
+import { getThreadSnapshot, listOwnPostReplies, MAX_POST_REPLIES } from '../services/timeline-replies.ts'
+import { getTimelinePage, reactionTarget } from '../services/timeline.ts'
 import { withTimeout } from '../services/with-timeout.ts'
 import { type AnyMiddleware, type TypedRouter, typedRouter } from '../typed-router.ts'
 import { validateBody, validateQuery } from '../validation.ts'
@@ -93,13 +97,14 @@ export interface FeedDeliver {
   createdChallenge: (user: string, post: FeedPostRecord) => void
   /** Federate a challenge-share edit as an `Update`. */
   updatedChallenge: (user: string, post: FeedPostRecord) => void
+  /** Fan a fresh reply out to followers AND the inbox of the author it answers. */
+  createdReply: (user: string, post: FeedPostRecord) => void
+  /** Federate a reply edit as an `Update`, to the same recipients. */
+  updatedReply: (user: string, post: FeedPostRecord) => void
 }
 
 /** RFC 4122 canonical form — timeline entry ids are UUIDs. */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-
-/** Total budget for one reply-thread snapshot (object + collection + authors). */
-const REPLIES_TIMEOUT_MS = 12_000
 
 /** Newest-first cap on the "who liked / boosted this" list. */
 const MAX_POST_REACTIONS = 100
@@ -121,7 +126,7 @@ export const createFeedRouter = (
   retroEnrichTimeline?: RetroEnrichTrigger,
   /** Canonical web origin, to build a shared challenge's public URL (#994). */
   webHost?: string,
-  /** Outbound like ⭐ / boost 🔄 toggles; absent → those routes answer 503. */
+  /** Outbound like ⭐ / boost 🔄 / reply 🗨 actions; absent → those routes answer 503. */
   reactions?: ReactionActions,
 ): TypedRouter => {
   const router = typedRouter()
@@ -135,6 +140,7 @@ export const createFeedRouter = (
       const settings = await getSettings(user).catch(() => null)
       const { next_cursor, posts } = await getFeedPage(user, req.query.limit, req.query.cursor, {
         includeStructured: true,
+        origin: webHost,
         settings,
       })
       res.json({ next_cursor, posts, success: true })
@@ -204,28 +210,49 @@ export const createFeedRouter = (
     },
   )
 
-  // Live snapshot of a timeline post's remote reply thread (#1060). Nothing is
-  // stored; `no-store` because the origin's thread changes under us. Bounded
-  // fetch budget inside, plus a hard timeout so a slow origin can't pin the
-  // request.
+  // Live snapshot of a timeline post's reply thread (#1060), with the reader's
+  // OWN replies to the same object merged in. Nothing is stored; `no-store`
+  // because the origin's thread changes under us. Bounded fetch budget inside,
+  // plus a hard timeout so a slow origin can't pin the request. `fetched: false`
+  // says the origin's thread couldn't be read at all — an empty list then means
+  // "unknown", not "no replies" (#1065).
   router.get<{ id: string }, TimelineRepliesResponse>(
     '/timeline/:id/replies',
     authMiddleware,
     async (req, res) => {
       const user = req.user!
-      if (!UUID_RE.test(req.params.id)) {
-        return res.status(404).json({ error: 'Not found', partial: false, replies: [], success: false })
-      }
+      const notFound = { error: 'Not found', fetched: false, partial: false, replies: [], success: false }
+      if (!UUID_RE.test(req.params.id)) return res.status(404).json(notFound)
       const entry = await getTimelineEntryById(user, req.params.id)
-      if (entry == null) {
-        return res.status(404).json({ error: 'Not found', partial: false, replies: [], success: false })
+      if (entry == null) return res.status(404).json(notFound)
+      if (!webHost) {
+        return res.status(503).json({ ...notFound, error: 'Replies are not available' })
       }
-      const { partial, replies } = await withTimeout(
-        fetchRemoteReplies(entry.object_uri),
+      // A boost card stands for the ORIGINAL Note, so its thread is the
+      // original's — the same target a like or a reply resolves.
+      const snapshot = await withTimeout(
+        getThreadSnapshot(user, webHost, reactionTarget(entry)),
         REPLIES_TIMEOUT_MS,
-      ).catch(() => ({ partial: true, replies: [] }))
+      ).catch(() => ({ fetched: false, partial: true, replies: [] }))
       res.setHeader('Cache-Control', 'no-store')
-      res.json({ partial, replies, success: true })
+      res.json({ ...snapshot, success: true })
+    },
+  )
+
+  // Reply 🗨 to one home-timeline post, addressed by the entry's LOCAL id (what
+  // the card has). Publishes a `reply` feed post and delivers its
+  // `Create{Note inReplyTo}` to followers AND the answered author's inbox.
+  // Registered before the generic `/:postId` routes.
+  router.post<{ id: string }, FeedPostResponse, ReplyToPostBody>(
+    '/timeline/:id/reply',
+    authMiddleware,
+    validateBody(replyToPostBodySchema),
+    async (req, res) => {
+      if (!reactions) return res.status(503).json({ error: 'Replies are not available', success: false })
+      if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Not found', success: false })
+      const result = await reactions.reply(req.user!, req.params.id, req.body)
+      if (!result.ok) return res.status(result.status).json({ error: result.error, success: false })
+      res.json({ post: result.post, success: true })
     },
   )
 
@@ -293,6 +320,29 @@ export const createFeedRouter = (
       }
       const rows = await listFeedPostReactions(user, req.params.postId, MAX_POST_REACTIONS)
       res.json({ reactions: rows.map(serializeFeedPostReaction), success: true })
+    },
+  )
+
+  // The comments under one of the owner's OWN posts: the replies this instance
+  // already holds as timeline entries (any actor's Note answering an existing
+  // own post is admitted on ingest — #1060), oldest first. No network.
+  // Registered before the generic `/:postId` routes, like `/reactions`.
+  router.get<{ postId: string }, FeedPostRepliesResponse>(
+    '/:postId/replies',
+    authMiddleware,
+    async (req, res) => {
+      const user = req.user!
+      if (!UUID_RE.test(req.params.postId)) {
+        return res.status(404).json({ error: 'Feed post not found', replies: [], success: false })
+      }
+      if (!webHost) {
+        return res.status(503).json({ error: 'Replies are not available', replies: [], success: false })
+      }
+      if ((await getFeedPostById(user, req.params.postId)) == null) {
+        return res.status(404).json({ error: 'Feed post not found', replies: [], success: false })
+      }
+      const replies = await listOwnPostReplies(user, webHost, req.params.postId, MAX_POST_REPLIES)
+      res.json({ replies, success: true })
     },
   )
 
@@ -475,6 +525,7 @@ export const createFeedRouter = (
       // activity, so it must go through the article path — `updated` would no-op.
       if (record.kind === 'article') deliver?.updatedArticle(user, record)
       else if (record.kind === 'challenge') deliver?.updatedChallenge(user, record)
+      else if (record.kind === 'reply') deliver?.updatedReply(user, record)
       else deliver?.updated(user, record)
       res.json({ post: await serializeFeedPost(user, record, { includeStructured: true }), success: true })
     },

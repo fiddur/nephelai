@@ -19,9 +19,20 @@
  */
 import type { FeedPost } from '@aurboda/api-spec'
 
-import type { Activity, FeedPostCursor, FeedPostReactionCount, FeedPostRecord } from '../db/index.ts'
+import type {
+  Activity,
+  FeedPostCursor,
+  FeedPostReactionCount,
+  FeedPostRecord,
+  TimelineReplyCount,
+} from '../db/index.ts'
 
-import { countFeedPostReactions, getActivityById, listFeedPosts } from '../db/index.ts'
+import {
+  countFeedPostReactions,
+  countTimelineRepliesTo,
+  getActivityById,
+  listFeedPosts,
+} from '../db/index.ts'
 import { resolveActivityScalars } from './activitypub/feed-activity.ts'
 import { feedPostContent, formatActivityWindow } from './activitypub/object.ts'
 import {
@@ -32,6 +43,7 @@ import {
 import { decodeKeysetCursor, encodeKeysetCursor } from './keyset-cursor.ts'
 import { resolveActivityWindow } from './queries/index.ts'
 import { getSettings } from './settings.ts'
+import { withReplyCounts } from './timeline-replies.ts'
 
 /** Options for `serializeFeedPost`. */
 export interface SerializeFeedPostOpts {
@@ -157,6 +169,21 @@ const resolveActivityPresentation = async (
 }
 
 /**
+ * What a `reply` post answers — the target object, its author, and the handle
+ * snapshot naming the federated `Mention`. Every other kind exposes none of it.
+ */
+const replyTargetFields = (
+  record: FeedPostRecord,
+): Pick<FeedPost, 'in_reply_to_actor_uri' | 'in_reply_to_handle' | 'in_reply_to_uri'> =>
+  record.kind === 'reply'
+    ? {
+        in_reply_to_actor_uri: record.in_reply_to_actor_uri ?? undefined,
+        in_reply_to_handle: record.in_reply_to_handle ?? undefined,
+        in_reply_to_uri: record.in_reply_to_uri ?? undefined,
+      }
+    : {}
+
+/**
  * Serialise a stored feed post for the owner-facing REST/MCP surface, enriching
  * it with the shared activity's title/type, the **merged-span** window, and the
  * exact `content` HTML the post federates with — all resolved at query time. A
@@ -195,6 +222,9 @@ export const serializeFeedPost = async (
     include_chart: record.include_chart,
     include_map: record.include_map,
     included_metrics: record.included_metrics,
+    // Present only for a `reply` post: what it answers (drives the "replying to
+    // @handle" line on the owner's own card).
+    ...replyTargetFields(record),
     kind: record.kind,
     message: record.message ?? undefined,
     metrics,
@@ -214,6 +244,18 @@ export type FeedPostsFetcher = (
 
 /** Batched like/boost tallies for a page of posts — the second DB dependency of `getFeedPage`. */
 export type FeedReactionCountsFetcher = (user: string, postIds: string[]) => Promise<FeedPostReactionCount[]>
+
+/** Batched reply tallies for a page of posts, keyed by each post's object URI. */
+export type FeedReplyCountsFetcher = (user: string, objectUris: string[]) => Promise<TimelineReplyCount[]>
+
+/** Options for `getFeedPage`: the serialisation opts plus what the counts need. */
+export interface FeedPageOpts extends SerializeFeedPostOpts {
+  /**
+   * Web origin. Present, each post's `reply_count` is looked up by its object
+   * URI (one grouped query per page); absent, the page carries no reply counts.
+   */
+  origin?: string
+}
 
 /**
  * Attach `like_count` / `boost_count` to a page of serialised posts from ONE
@@ -252,9 +294,10 @@ export const getFeedPage = async (
   user: string,
   limit: number,
   cursor: string | undefined,
-  opts: SerializeFeedPostOpts = {},
+  opts: FeedPageOpts = {},
   fetchPosts: FeedPostsFetcher = listFeedPosts,
   fetchReactionCounts: FeedReactionCountsFetcher = countFeedPostReactions,
+  fetchReplyCounts: FeedReplyCountsFetcher = countTimelineRepliesTo,
 ): Promise<{ posts: FeedPost[]; next_cursor: string | null }> => {
   const decoded = decodeKeysetCursor(cursor)
   const rows = await fetchPosts(user, limit + 1, decoded && { created_at: decoded.ts, id: decoded.id })
@@ -262,11 +305,13 @@ export const getFeedPage = async (
   const page = hasMore ? rows.slice(0, limit) : rows
   const last = page[page.length - 1]
   const posts = await Promise.all(page.map((record) => serializeFeedPost(user, record, opts)))
+  // Only the LISTING carries reaction + reply counts (one batched query each per
+  // page); single-post responses leave them absent.
+  const counted = await withReactionCounts(user, posts, fetchReactionCounts)
   return {
     next_cursor: hasMore && last ? encodeKeysetCursor(last.created_at, last.id) : null,
-    // Only the LISTING carries reaction counts (one batched query per page);
-    // single-post responses leave them absent.
-    posts: await withReactionCounts(user, posts, fetchReactionCounts),
+    posts:
+      opts.origin == null ? counted : await withReplyCounts(user, opts.origin, counted, fetchReplyCounts),
   }
 }
 

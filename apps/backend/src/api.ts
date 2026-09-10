@@ -80,9 +80,12 @@ import {
   deliverFeedChallengeUpdate,
   deliverFeedDelete,
   deliverFeedPost,
+  deliverFeedReplyPost,
+  deliverFeedReplyUpdate,
   deliverFeedUpdate,
   toDeliverableArticle,
   toDeliverableChallenge,
+  toDeliverableReply,
 } from './services/activitypub/deliver.ts'
 import { createFeedFederation, deliverActorUpdate } from './services/activitypub/federation.ts'
 import { createTimelineBackfiller } from './services/activitypub/timeline-backfill.ts'
@@ -506,6 +509,20 @@ const main = async () => {
         )
       }
     },
+    // A reply federates like a challenge share — a self-contained Note — but
+    // additionally to the inbox of the author it answers, who need not follow us.
+    createdReply: (user, post) => {
+      const reply = toDeliverableReply(post)
+      if (reply) {
+        void deliverFeedReplyPost(feedDeps, user, reply).catch(onDeliverError('create', user, post.id))
+      }
+    },
+    updatedReply: (user, post) => {
+      const reply = toDeliverableReply(post)
+      if (reply) {
+        void deliverFeedReplyUpdate(feedDeps, user, reply).catch(onDeliverError('update', user, post.id))
+      }
+    },
   }
   // Auto-share rules (#903): evaluate settled activities against enabled rules
   // after a stabilisation delay, publishing matches through the SAME
@@ -599,7 +616,7 @@ const main = async () => {
   }
   // Outbound likes ⭐ / boosts 🔄 on the home timeline, on the same federation +
   // origin, shared by the REST feed router and the MCP reaction tools.
-  const reactionActions = createReactionActions(feedDeps)
+  const reactionActions = createReactionActions(feedDeps, feedDeliver)
   // The follower-management operations (approve/reject a follow request), sharing
   // the same federation + origin. Approve returns the serialised follower.
   const followerActions: FollowerActions = {

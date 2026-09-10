@@ -1,4 +1,4 @@
-import type { TimelineEntry } from '@aurboda/api-spec'
+import type { FeedPost, TimelineEntry } from '@aurboda/api-spec'
 import type { RequestHandler } from 'express'
 import type { AddressInfo } from 'node:net'
 
@@ -130,6 +130,10 @@ const fakeReactions = (
   const actions: ReactionActions = {
     boost: record('boost'),
     like: record('like'),
+    reply: async (_user, entryId) => {
+      calls.push(`reply:${entryId}`)
+      return { error: 'not stubbed', ok: false, status: 500 }
+    },
     unboost: record('unboost'),
     unlike: record('unlike'),
   }
@@ -186,5 +190,106 @@ describe('timeline reaction routes', () => {
     const res = await supertest(reactionApp()).post(`/feed/timeline/${ENTRY_ID}/boost`)
     expect(res.status).toBe(503)
     expect(res.body).toEqual({ error: 'Reactions are not available', success: false })
+  })
+})
+
+describe('POST /feed/timeline/:id/reply', () => {
+  const POST_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+
+  const replyPost = (): FeedPost => ({
+    activity_id: null,
+    created_at: '2026-09-01T00:00:00.000Z',
+    id: POST_ID,
+    in_reply_to_actor_uri: 'https://mastodon.example/users/alice',
+    in_reply_to_handle: '@alice@mastodon.example',
+    in_reply_to_uri: 'https://mastodon.example/notes/1',
+    include_chart: false,
+    include_map: false,
+    included_metrics: [],
+    kind: 'reply',
+    message: 'Nice run!',
+    series_metrics: [],
+    updated_at: '2026-09-01T00:00:00.000Z',
+    visibility: 'unlisted',
+  })
+
+  /** A ReactionActions stub recording only the reply calls. */
+  const fakeReplyActions = (result: Awaited<ReturnType<ReactionActions['reply']>>) => {
+    const calls: { entryId: string; body: unknown }[] = []
+    const unused = async () => ({ error: 'unused', ok: false as const, status: 500 })
+    const actions: ReactionActions = {
+      boost: unused,
+      like: unused,
+      reply: async (_user, entryId, body) => {
+        calls.push({ body, entryId })
+        return result
+      },
+      unboost: unused,
+      unlike: unused,
+    }
+    return { actions, calls }
+  }
+
+  const replyApp = (reactions?: ReactionActions) => {
+    const app = express()
+    app.use(express.json())
+    app.use('/feed', createFeedRouter(auth, undefined, undefined, undefined, undefined, undefined, reactions))
+    return app
+  }
+
+  test('returns the created reply post and defaults visibility to unlisted', async () => {
+    const { actions, calls } = fakeReplyActions({ ok: true, post: replyPost() })
+    const res = await supertest(replyApp(actions))
+      .post(`/feed/timeline/${ENTRY_ID}/reply`)
+      .send({ message: 'Nice run!' })
+    expect(res.status).toBe(200)
+    expect(res.body.success).toBe(true)
+    expect(res.body.post.kind).toBe('reply')
+    expect(calls).toEqual([{ body: { message: 'Nice run!', visibility: 'unlisted' }, entryId: ENTRY_ID }])
+  })
+
+  test('passes an explicit visibility through', async () => {
+    const { actions, calls } = fakeReplyActions({ ok: true, post: replyPost() })
+    await supertest(replyApp(actions))
+      .post(`/feed/timeline/${ENTRY_ID}/reply`)
+      .send({ message: 'hi', visibility: 'public' })
+    expect(calls[0].body).toEqual({ message: 'hi', visibility: 'public' })
+  })
+
+  test('rejects a blank message at the schema boundary, never reaching the action', async () => {
+    const { actions, calls } = fakeReplyActions({ ok: true, post: replyPost() })
+    const res = await supertest(replyApp(actions))
+      .post(`/feed/timeline/${ENTRY_ID}/reply`)
+      .send({ message: '   ' })
+    expect(res.status).toBe(400)
+    expect(calls).toEqual([])
+  })
+
+  test('surfaces the action’s own failure status', async () => {
+    const { actions } = fakeReplyActions({
+      error: 'Couldn’t reach the author’s server. Please try again later.',
+      ok: false,
+      status: 502,
+    })
+    const res = await supertest(replyApp(actions))
+      .post(`/feed/timeline/${ENTRY_ID}/reply`)
+      .send({ message: 'hi' })
+    expect(res.status).toBe(502)
+    expect(res.body.success).toBe(false)
+  })
+
+  test('404s a non-UUID entry id without calling the action', async () => {
+    const { actions, calls } = fakeReplyActions({ ok: true, post: replyPost() })
+    const res = await supertest(replyApp(actions))
+      .post('/feed/timeline/not-a-uuid/reply')
+      .send({ message: 'hi' })
+    expect(res.status).toBe(404)
+    expect(calls).toEqual([])
+  })
+
+  test('503s when reactions are not wired', async () => {
+    const res = await supertest(replyApp()).post(`/feed/timeline/${ENTRY_ID}/reply`).send({ message: 'hi' })
+    expect(res.status).toBe(503)
+    expect(res.body).toEqual({ error: 'Replies are not available', success: false })
   })
 })

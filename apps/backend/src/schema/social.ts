@@ -171,6 +171,22 @@ export const socialTables: Record<string, string> = {
   feed_posts_autoshare_column: `
     ALTER TABLE feed_posts ADD COLUMN IF NOT EXISTS autoshare_rule_id UUID;
   `,
+  // Reply posts (kind = 'reply'): what this post answers. The target object id
+  // and its author's actor URI come from the timeline entry being replied to
+  // (never client-supplied); the handle is the `@user@host` snapshot naming the
+  // federated `Mention`, same snapshot rule as timeline_entry.handle. Additive
+  // for pre-existing tables (idempotent).
+  feed_posts_reply_columns: `
+    ALTER TABLE feed_posts ADD COLUMN IF NOT EXISTS in_reply_to_uri TEXT;
+    ALTER TABLE feed_posts ADD COLUMN IF NOT EXISTS in_reply_to_actor_uri TEXT;
+    ALTER TABLE feed_posts ADD COLUMN IF NOT EXISTS in_reply_to_handle TEXT;
+  `,
+  // The owner's own replies to one target, for the thread-snapshot merge.
+  feed_posts_reply_indexes: `
+    CREATE INDEX IF NOT EXISTS idx_feed_posts_in_reply_to
+      ON feed_posts (in_reply_to_uri, created_at)
+      WHERE in_reply_to_uri IS NOT NULL
+  `,
 
   // Activities whose feed post the user DELETED (#903): auto-share must never
   // republish them. feed_posts rows are hard-deleted, so the "at most one post
@@ -404,6 +420,14 @@ export const socialTables: Record<string, string> = {
     CREATE INDEX IF NOT EXISTS idx_timeline_entry_unenriched
       ON timeline_entry (published_at DESC, id DESC)
       WHERE structured IS NULL AND enrich_attempted_at IS NULL
+  `,
+  // Comments under the owner's own posts: both the per-post listing and the
+  // batched count for a feed page filter on the reply target, so give them a
+  // partial index instead of a scan of the whole timeline per feed read.
+  timeline_entry_reply_target_indexes: `
+    CREATE INDEX IF NOT EXISTS idx_timeline_entry_in_reply_to
+      ON timeline_entry (in_reply_to_uri, published_at, id)
+      WHERE in_reply_to_uri IS NOT NULL
   `,
 
   // The user's OWN outbound reactions: a `Like` (favourite) or `Announce`

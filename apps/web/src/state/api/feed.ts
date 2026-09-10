@@ -4,6 +4,7 @@ import type {
   FeedPost,
   FeedPostReaction,
   FeedPostReactionsResponse,
+  FeedPostRepliesResponse,
   FeedPostResponse,
   FeedPostsResponse,
   FollowActorResponse,
@@ -13,6 +14,7 @@ import type {
   FollowersResponse,
   FollowingActor,
   FollowingResponse,
+  ReplyToPostBody,
   ShareActivityBody,
   ShareChallengeBody,
   SharePreviewResponse,
@@ -284,6 +286,39 @@ export const boostTimelineEntry = (entryId: string): Promise<TimelineEntry> =>
 /** Retract your boost (delivers an `Undo{Announce}`). */
 export const unboostTimelineEntry = (entryId: string): Promise<TimelineEntry> =>
   toggleReaction(entryId, 'boost', false)
+
+/**
+ * Reply 🗨 to a home-timeline post. Publishes a reply post delivered to the
+ * user's followers AND the answered author's inbox; returns the created post.
+ */
+export const replyToTimelineEntry = async (entryId: string, body: ReplyToPostBody): Promise<FeedPost> => {
+  let response
+  try {
+    response = await axios.post<FeedPostResponse>(
+      `${API_URL}/feed/timeline/${encodeURIComponent(entryId)}/reply`,
+      body,
+      { headers: authHeaders() },
+    )
+  } catch (error) {
+    // Surface the server's reason (e.g. "Couldn't reach the author's server").
+    throw new Error(apiErrorMessage(error, 'Couldn’t post that reply. Please try again.'))
+  }
+  if (!response.data.post) throw new Error('Reply failed: no post returned')
+  return response.data.post
+}
+
+/**
+ * The comments this instance holds under one of YOUR posts (replies remote
+ * actors delivered to you) — full timeline entries, oldest first. No network
+ * fetch server-side.
+ */
+export const fetchFeedPostReplies = async (postId: string): Promise<TimelineEntry[]> => {
+  const response = await axios.get<FeedPostRepliesResponse>(
+    `${API_URL}/feed/${encodeURIComponent(postId)}/replies`,
+    { headers: authHeaders() },
+  )
+  return response.data.replies
+}
 
 /** Who favourited or boosted one of YOUR feed posts, newest first. */
 export const fetchFeedPostReactions = async (postId: string): Promise<FeedPostReaction[]> => {

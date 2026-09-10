@@ -30,6 +30,12 @@ export interface FeedPostRecord {
   challenge: ChallengeShare | null
   /** The author's personal message (plain text), or null when none was shared. */
   message: string | null
+  /** The replied-to object id; null unless kind = 'reply'. */
+  in_reply_to_uri: string | null
+  /** The replied-to post author's actor URI; null unless kind = 'reply'. */
+  in_reply_to_actor_uri: string | null
+  /** The replied-to author's `@user@host` at reply time (names the `Mention`). */
+  in_reply_to_handle: string | null
   /** The auto-share rule that created this post (#903), or null for manual posts. */
   autoshare_rule_id: string | null
   /** Unguessable capability token for `followers`-only image URLs (see schema). */
@@ -64,6 +70,23 @@ export interface ChallengePostInput {
   message?: string | null
 }
 
+/**
+ * Input for a `reply` post: the reply text plus what it answers. Every target
+ * field is resolved server-side from the timeline entry being replied to, so a
+ * stored reply can never claim a target the reader never received.
+ */
+export interface ReplyPostInput {
+  visibility: FeedVisibility
+  /** The reply text (markdown). Non-blank — validated at the request boundary. */
+  message: string
+  /** The replied-to object's canonical AS2 id. */
+  in_reply_to_uri: string
+  /** The replied-to post author's actor URI (the `Mention` href). */
+  in_reply_to_actor_uri: string
+  /** The replied-to author's `@user@host` at reply time (the `Mention` name), if known. */
+  in_reply_to_handle?: string | null
+}
+
 export interface FeedPostPatch {
   included_metrics?: string[]
   series_metrics?: string[]
@@ -77,7 +100,7 @@ export interface FeedPostPatch {
 }
 
 const FEED_POST_COLUMNS =
-  'id, kind, activity_id, included_metrics, series_metrics, visibility, include_map, include_chart, article, challenge, message, autoshare_rule_id, image_token, created_at, updated_at'
+  'id, kind, activity_id, included_metrics, series_metrics, visibility, include_map, include_chart, article, challenge, message, in_reply_to_uri, in_reply_to_actor_uri, in_reply_to_handle, autoshare_rule_id, image_token, created_at, updated_at'
 
 interface FeedPostRow {
   id: string
@@ -92,6 +115,9 @@ interface FeedPostRow {
   article: ArticleContent | null
   challenge: ChallengeShare | null
   message: string | null
+  in_reply_to_uri: string | null
+  in_reply_to_actor_uri: string | null
+  in_reply_to_handle: string | null
   autoshare_rule_id: string | null
   image_token: string
   created_at: Date
@@ -156,6 +182,44 @@ export const createChallengePost = async (
   return mapFeedPost(result.rows[0])
 }
 
+/**
+ * Create a `reply` post: the reply text plus the resolved target (object id,
+ * author actor URI, author handle snapshot). No activity anchor and no shared
+ * metrics — a reply is a comment, not a data share.
+ */
+export const createReplyPost = async (user: string, input: ReplyPostInput): Promise<FeedPostRecord> => {
+  const result = await query<FeedPostRow>(
+    user,
+    `INSERT INTO feed_posts (kind, visibility, message, in_reply_to_uri, in_reply_to_actor_uri, in_reply_to_handle)
+     VALUES ('reply', $1, $2, $3, $4, $5)
+     RETURNING ${FEED_POST_COLUMNS}`,
+    [
+      input.visibility,
+      input.message,
+      input.in_reply_to_uri,
+      input.in_reply_to_actor_uri,
+      input.in_reply_to_handle ?? null,
+    ],
+  )
+  return mapFeedPost(result.rows[0])
+}
+
+/**
+ * The user's OWN replies to one object, oldest first — merged into the live
+ * thread snapshot of a timeline card so a reply shows immediately, whether or
+ * not the origin's `replies` collection lists it yet.
+ */
+export const listReplyPostsTo = async (user: string, objectUri: string): Promise<FeedPostRecord[]> => {
+  const result = await query<FeedPostRow>(
+    user,
+    `SELECT ${FEED_POST_COLUMNS} FROM feed_posts
+      WHERE kind = 'reply' AND in_reply_to_uri = $1
+      ORDER BY created_at ASC, id ASC`,
+    [objectUri],
+  )
+  return result.rows.map(mapFeedPost)
+}
+
 /** Keyset position in the owner's feed: the previous page's last `(created_at, id)`. */
 export interface FeedPostCursor {
   created_at: Date
@@ -200,6 +264,17 @@ export const listPublicFeedPosts = async (user: string): Promise<FeedPostRecord[
   return result.rows.map(mapFeedPost)
 }
 
+/** Options for `listPublicFeedPostsPage`. */
+export interface PublicFeedPageOpts {
+  /**
+   * Whether `reply` posts are listed. The ActivityPub outbox lists everything
+   * the actor published (default), while the public profile's post tab hides
+   * replies — Mastodon's own default profile tab does the same, and a bare
+   * comment out of its thread reads as noise.
+   */
+  includeReplies?: boolean
+}
+
 /**
  * One page of public outbox posts, newest-first, for the cursor-paginated
  * ActivityPub outbox. `limit`/`offset` are clamped by the caller.
@@ -208,14 +283,16 @@ export const listPublicFeedPostsPage = async (
   user: string,
   limit: number,
   offset: number,
+  opts: PublicFeedPageOpts = {},
 ): Promise<FeedPostRecord[]> => {
   const result = await query<FeedPostRow>(
     user,
     `SELECT ${FEED_POST_COLUMNS} FROM feed_posts
       WHERE visibility IN ('public', 'unlisted')
+        AND ($3::boolean OR kind <> 'reply')
       ORDER BY created_at DESC, id DESC
       LIMIT $1 OFFSET $2`,
-    [limit, offset],
+    [limit, offset, opts.includeReplies ?? true],
   )
   return result.rows.map(mapFeedPost)
 }

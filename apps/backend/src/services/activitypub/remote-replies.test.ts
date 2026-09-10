@@ -172,4 +172,58 @@ describe('fetchRemoteReplies', () => {
     expect(replies).toEqual([])
     expect(partial).toBe(false)
   })
+
+  test('carries each reply’s origin-checked object id, so a merge can match on it', async () => {
+    const deps = depsFor({
+      [POST]: { id: POST, replies: { items: [reply(1)] } },
+      'https://mastodon.example/users/u1': actor(1),
+    })
+    const { replies } = await fetchRemoteReplies(POST, deps)
+    expect(replies[0].object_uri).toBe('https://mastodon.example/notes/r1')
+  })
+})
+
+describe('fetchRemoteReplies fetched flag (#1065)', () => {
+  test('an unreachable post reports fetched: false — empty means unknown, not empty', async () => {
+    const { fetched, replies } = await fetchRemoteReplies(POST, depsFor({}))
+    expect(fetched).toBe(false)
+    expect(replies).toEqual([])
+  })
+
+  test('a post declaring no replies collection was still READ (fetched: true)', async () => {
+    const { fetched, replies } = await fetchRemoteReplies(POST, depsFor({ [POST]: { id: POST } }))
+    expect(fetched).toBe(true)
+    expect(replies).toEqual([])
+  })
+
+  test('an empty but readable collection reports fetched: true', async () => {
+    const deps = depsFor({ [POST]: { id: POST, replies: { items: [] } } })
+    const { fetched, replies } = await fetchRemoteReplies(POST, deps)
+    expect(fetched).toBe(true)
+    expect(replies).toEqual([])
+  })
+
+  test('a declared collection we cannot fetch reports fetched: false', async () => {
+    const deps = depsFor({ [POST]: { id: POST, replies: `${POST}/replies` } })
+    const { fetched, replies } = await fetchRemoteReplies(POST, deps)
+    expect(fetched).toBe(false)
+    expect(replies).toEqual([])
+  })
+
+  test('a readable thread reports fetched: true', async () => {
+    const deps = depsFor({
+      [POST]: { id: POST, replies: { items: [reply(1)] } },
+      'https://mastodon.example/users/u1': actor(1),
+    })
+    const { fetched, replies } = await fetchRemoteReplies(POST, deps)
+    expect(fetched).toBe(true)
+    expect(replies).toHaveLength(1)
+  })
+
+  test('an unparseable object id never reaches the network', async () => {
+    const deps = depsFor({})
+    const { fetched } = await fetchRemoteReplies('not a url', deps)
+    expect(fetched).toBe(false)
+    expect(deps.calls).toEqual([])
+  })
 })

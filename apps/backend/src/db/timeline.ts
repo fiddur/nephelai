@@ -217,6 +217,54 @@ export const getTimelineEntryByObjectUri = async (
   return result.rows[0] ?? null
 }
 
+/**
+ * The replies this instance holds for one object, oldest first — the comments
+ * under one of the owner's own posts. These are ordinary timeline rows: any
+ * actor's Note that replied to an existing own post is admitted on ingest
+ * (#1060), so no network is involved in reading them back.
+ */
+export const listTimelineRepliesTo = async (
+  user: string,
+  objectUri: string,
+  limit: number,
+): Promise<TimelineEntryRecord[]> => {
+  const result = await query<TimelineEntryRecord>(
+    user,
+    `SELECT ${TIMELINE_COLUMNS} FROM timeline_entry
+     WHERE in_reply_to_uri = $1
+     ORDER BY published_at ASC, id ASC
+     LIMIT $2`,
+    [objectUri, limit],
+  )
+  return result.rows
+}
+
+/** How many replies one object has, per object — the batched form for a feed page. */
+export interface TimelineReplyCount {
+  in_reply_to_uri: string
+  count: number
+}
+
+/**
+ * Reply tallies for a whole page of the owner's posts — ONE grouped query, so
+ * the feed listing never pays a count per post. Objects with no replies are
+ * simply absent from the result.
+ */
+export const countTimelineRepliesTo = async (
+  user: string,
+  objectUris: string[],
+): Promise<TimelineReplyCount[]> => {
+  if (objectUris.length === 0) return []
+  const result = await query<TimelineReplyCount>(
+    user,
+    `SELECT in_reply_to_uri, count(*)::int AS count FROM timeline_entry
+     WHERE in_reply_to_uri = ANY($1::text[])
+     GROUP BY in_reply_to_uri`,
+    [objectUris],
+  )
+  return result.rows
+}
+
 /** A legacy entry whose reply/Mention state is unknown (pre-#1060 ingest). */
 export interface ReplyUncheckedEntry {
   id: string

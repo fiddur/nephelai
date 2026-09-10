@@ -113,7 +113,12 @@ export const createFeedPublicRouter = (): TypedRouter => {
       return res.status(404).json({ error: 'Not found', posts: [], success: false })
     }
     try {
-      const records = await listPublicFeedPostsPage(username, PROFILE_FEED_LIMIT, 0)
+      // Replies are excluded here (the outbox still lists them): Mastodon's own
+      // default profile tab hides replies, and a bare comment lifted out of its
+      // thread reads as noise on a profile.
+      const records = await listPublicFeedPostsPage(username, PROFILE_FEED_LIMIT, 0, {
+        includeReplies: false,
+      })
       const settings = await getSettings(username).catch(() => null)
       const hourBucket = Math.floor(Date.now() / 3_600_000)
       const posts = await Promise.all(

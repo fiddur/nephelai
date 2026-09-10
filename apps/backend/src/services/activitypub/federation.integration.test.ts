@@ -14,9 +14,11 @@ import { markFeedFollowingAccepted, upsertFeedFollowing } from '../../db/feed-fo
 import {
   createArticlePost,
   createFeedPost,
+  createReplyPost,
   deleteFeedPost,
   type FeedPostInput,
   getFeedTombstone,
+  listPublicFeedPostsPage,
 } from '../../db/feed.ts'
 import { getProfileAvatarVersion, upsertProfileAvatar } from '../../db/profile-avatar.ts'
 import { upsertUserSettings } from '../../db/settings.ts'
@@ -400,6 +402,76 @@ describe('Feed federation actor + WebFinger', () => {
     // Title leads the content (Mastodon ignores a Note's name); prose follows.
     expect(doc.content).toContain('<strong>Weekly review</strong>')
     expect(doc.content).toContain('<strong>analysis</strong>')
+  })
+
+  test('federates a reply as a Create{Note inReplyTo} and serves its object', async () => {
+    const user = getTestUser()
+    const target = 'https://mastodon.example/users/alice/statuses/9'
+    const targetActor = 'https://mastodon.example/users/alice'
+    const post = await createReplyPost(user, {
+      in_reply_to_actor_uri: targetActor,
+      in_reply_to_handle: '@alice@mastodon.example',
+      in_reply_to_uri: target,
+      message: 'Nice **run**!',
+      visibility: 'unlisted',
+    })
+    const noteId = `${ORIGIN}/users/${user}/feed/${post.id}`
+
+    const page = (await (await fetchAs2(`/users/${user}/outbox?cursor=0`)).json()) as {
+      orderedItems?: unknown[]
+    }
+    const create = (page.orderedItems ?? [])[0] as {
+      type: string
+      object: string | { id: string; inReplyTo?: string }
+    }
+    expect(create.type).toBe('Create')
+    const object = typeof create.object === 'string' ? { id: create.object } : create.object
+    expect(object.id).toBe(noteId)
+
+    const res = await fetchAs2(`/users/${user}/feed/${post.id}`)
+    expect(res.status).toBe(200)
+    const doc = (await res.json()) as {
+      type: string
+      id: string
+      content?: string
+      inReplyTo?: string
+      cc?: string | string[]
+      tag?: unknown
+    }
+    expect(doc.type).toBe('Note')
+    expect(doc.id).toBe(noteId)
+    expect(doc.inReplyTo).toBe(target)
+    expect(doc.content).toContain('class="u-url mention"')
+    expect(doc.content).toContain('<strong>run</strong>')
+    // The replied-to author is addressed AND tagged, so their server accepts and
+    // links the reply even though they don't follow us.
+    expect(JSON.stringify(doc.cc)).toContain(targetActor)
+    const tags = Array.isArray(doc.tag) ? doc.tag : [doc.tag]
+    expect(JSON.stringify(tags)).toContain('"Mention"')
+    expect(JSON.stringify(tags)).toContain('@alice@mastodon.example')
+  })
+
+  test('the profile listing hides replies while the outbox still lists them', async () => {
+    const user = getTestUser()
+    const activityId = await insertExercise(user)
+    const share = await sharePost(user, activityId)
+    const reply = await createReplyPost(user, {
+      in_reply_to_actor_uri: 'https://mastodon.example/users/alice',
+      in_reply_to_handle: '@alice@mastodon.example',
+      in_reply_to_uri: 'https://mastodon.example/users/alice/statuses/9',
+      message: 'hi',
+      visibility: 'public',
+    })
+
+    const page = (await (await fetchAs2(`/users/${user}/outbox?cursor=0`)).json()) as {
+      orderedItems?: unknown[]
+    }
+    expect(page.orderedItems ?? []).toHaveLength(2)
+    // The public-profile listing (feed-public-router) uses the same query with
+    // `includeReplies: false`.
+    const profile = await listPublicFeedPostsPage(user, 20, 0, { includeReplies: false })
+    expect(profile.map((p) => p.id)).toEqual([share.id])
+    expect(profile.map((p) => p.id)).not.toContain(reply.id)
   })
 
   test('serves the merged-span duration for a shared merged activity (#881)', async () => {
