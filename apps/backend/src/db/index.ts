@@ -267,6 +267,7 @@ export {
   listChallengeParticipations,
   listChallenges,
   listChallengesAwaitingResult,
+  listLeftChallengeUrls,
   listPublicChallenges,
   markChallengeResultPublished,
   removeChallengeMember,

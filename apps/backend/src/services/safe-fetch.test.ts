@@ -3,7 +3,7 @@
  */
 import { describe, expect, test } from 'vitest'
 
-import { assertPublicUrl } from './safe-fetch.ts'
+import { assertPublicUrl, SafeFetchError } from './safe-fetch.ts'
 
 describe('assertPublicUrl', () => {
   test('rejects loopback / private / link-local / reserved targets', async () => {
@@ -36,5 +36,19 @@ describe('assertPublicUrl', () => {
   test('allows public literal IPs', async () => {
     await expect(assertPublicUrl('https://8.8.8.8/x')).resolves.toBeUndefined()
     await expect(assertPublicUrl('http://1.1.1.1/x')).resolves.toBeUndefined()
+  })
+
+  test('refusals carry a code, so callers need not match on the message', async () => {
+    const codeOf = async (url: string): Promise<string | undefined> => {
+      try {
+        await assertPublicUrl(url)
+        return undefined
+      } catch (error) {
+        return error instanceof SafeFetchError ? error.code : `not-a-SafeFetchError: ${String(error)}`
+      }
+    }
+    expect(await codeOf('not a url')).toBe('invalid_url')
+    expect(await codeOf('ftp://example.com')).toBe('unsupported_scheme')
+    expect(await codeOf('http://127.0.0.1/x')).toBe('private_address')
   })
 })

@@ -14,6 +14,26 @@ import net from 'node:net'
 
 const DEFAULT_TIMEOUT_MS = 8000
 
+/**
+ * Why the guard refused. `dns` is the only *transient* one — the host may
+ * resolve again in a minute — so callers that cache a verdict (challenge
+ * discovery's per-instance memo) can tell "this is not an Aurboda host" from
+ * "we could not ask right now" without matching on message strings. A lookup
+ * that fails outright rejects with Node's own error (`ENOTFOUND`/`EAI_AGAIN`)
+ * instead, which those callers classify as transient too.
+ */
+export type SafeFetchErrorCode = 'invalid_url' | 'unsupported_scheme' | 'dns' | 'private_address'
+
+export class SafeFetchError extends Error {
+  readonly code: SafeFetchErrorCode
+
+  constructor(message: string, code: SafeFetchErrorCode) {
+    super(message)
+    this.name = 'SafeFetchError'
+    this.code = code
+  }
+}
+
 const ipv4ToOctets = (ip: string): number[] => ip.split('.').map((p) => Number.parseInt(p, 10))
 
 /** Private / loopback / link-local / reserved IPv4 ranges. */
@@ -58,18 +78,21 @@ export const assertPublicUrl = async (rawUrl: string): Promise<void> => {
   try {
     url = new URL(rawUrl)
   } catch {
-    throw new Error('Invalid URL')
+    throw new SafeFetchError('Invalid URL', 'invalid_url')
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error('Only http(s) URLs are allowed')
+    throw new SafeFetchError('Only http(s) URLs are allowed', 'unsupported_scheme')
   }
 
   const host = url.hostname.replaceAll(/^\[|\]$/g, '') // strip IPv6 brackets
   const addresses = net.isIP(host) ? [host] : (await dns.lookup(host, { all: true })).map((a) => a.address)
-  if (addresses.length === 0) throw new Error('Host did not resolve')
+  if (addresses.length === 0) throw new SafeFetchError('Host did not resolve', 'dns')
   for (const address of addresses) {
     if (isBlockedAddress(address)) {
-      throw new Error(`Refusing to fetch a private/loopback/reserved address (${address})`)
+      throw new SafeFetchError(
+        `Refusing to fetch a private/loopback/reserved address (${address})`,
+        'private_address',
+      )
     }
   }
 }

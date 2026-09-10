@@ -104,6 +104,17 @@ export const socialTables: Record<string, string> = {
     CREATE INDEX IF NOT EXISTS idx_challenge_participations_url ON challenge_participations (challenge_url)
   `,
 
+  // Challenges the user LEFT (#1093). Leaving hard-deletes the participation
+  // row, so the "don't suggest this again" fact needs its own record to survive
+  // the delete — discovery excludes these the way it excludes joined ones.
+  // Keyed by the canonical challenge URL; joining again clears the row.
+  challenge_left: `
+    CREATE TABLE IF NOT EXISTS challenge_left (
+      challenge_url  TEXT PRIMARY KEY,
+      left_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `,
+
   // Federated feed posts: activities the user published to their public feed.
   // `included_metrics` is the shared scalar-summary set; `series_metrics` is the
   // explicit high-resolution opt-in that authorizes the public `/series`
