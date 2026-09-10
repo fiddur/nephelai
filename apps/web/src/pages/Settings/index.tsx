@@ -248,9 +248,9 @@ export function Settings() {
             <span>Show replies in your timeline</span>
           </label>
           <p class="field-description">
-            When on, replies that people you follow write to <em>other</em> people show as their own
-            timeline cards. When off (the default), you see their top-level posts only — replies to your
-            own posts always show either way.
+            When on, every reply the people you follow write shows as its own timeline card. When off (the
+            default), replies to posts that aren’t in your timeline are hidden — replies to your own posts,
+            posts mentioning you, and replies within a thread you already see always show.
           </p>
         </div>
       </SettingsSection>

@@ -81,11 +81,23 @@ describe('POST /profile/avatar', () => {
 
 describe('DELETE /profile/avatar', () => {
   test('removes the avatar and notifies onAvatarChanged', async () => {
+    vi.mocked(db.deleteProfileAvatar).mockResolvedValue(true)
     const onAvatarChanged = vi.fn()
     const res = await supertest(buildApp(onAvatarChanged)).delete('/profile/avatar')
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ success: true })
     expect(db.deleteProfileAvatar).toHaveBeenCalledWith('tester')
     expect(onAvatarChanged).toHaveBeenCalledWith('tester')
+  })
+
+  test('a delete that removed nothing federates no Update{Person} (#1049)', async () => {
+    // Nothing about the actor document changed, so the followers' servers have
+    // nothing to re-fetch — a repeat DELETE must not fan out.
+    vi.mocked(db.deleteProfileAvatar).mockResolvedValue(false)
+    const onAvatarChanged = vi.fn()
+    const res = await supertest(buildApp(onAvatarChanged)).delete('/profile/avatar')
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ success: true })
+    expect(onAvatarChanged).not.toHaveBeenCalled()
   })
 })

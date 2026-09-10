@@ -183,7 +183,10 @@ function ShowRepliesToggle() {
     mutationFn: (show: boolean) => updateUserSettings({ timeline_show_replies: show }),
     onSuccess: (result) => {
       queryClient.setQueryData(['userSettings'], result)
-      void queryClient.invalidateQueries({ queryKey: ['feed', 'timeline'] })
+      // `exact`: the timeline pages themselves must refetch, but the expanded
+      // reply threads under TIMELINE_KEY must not — each is a live fetch of a
+      // remote origin's `replies` collection (#1062).
+      void queryClient.invalidateQueries({ exact: true, queryKey: ['feed', 'timeline'] })
     },
   })
   const show = mutation.isPending
@@ -197,7 +200,7 @@ function ShowRepliesToggle() {
         disabled={settingsQuery.isLoading || mutation.isPending}
         onChange={(e) => mutation.mutate((e.target as HTMLInputElement).checked)}
       />
-      <span>Show replies to others (replies to you always show)</span>
+      <span>Show replies to posts that aren’t in your timeline</span>
     </label>
   )
 }

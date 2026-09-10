@@ -4,7 +4,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
  * Integration tests for feed-post CRUD and the series-authorization window
  * lookup that guards the public `/series` endpoint.
  */
-import { cleanTestDb, getTestUser, startTestDb, stopTestDb } from '../test/db-test-helper.ts'
+import { cleanTestDb, getTestDbClient, getTestUser, startTestDb, stopTestDb } from '../test/db-test-helper.ts'
 import { deleteActivity, insertActivity } from './activities/index.ts'
 import {
   type ArticlePostInput,
@@ -20,6 +20,7 @@ import {
   getFeedTombstone,
   listFeedPosts,
   listPublicFeedPosts,
+  listPublicFeedPostsKeyset,
   listPublicFeedPostsPage,
   listReplyPostsTo,
   type ReplyPostInput,
@@ -39,6 +40,10 @@ const insertExercise = (user: string): Promise<string> =>
     start_time: ACTIVITY_START,
     title: 'Morning run',
   })
+
+/** Pin a post's `created_at` to an exact µs-precision instant (the keyset key). */
+const setCreatedAt = (id: string, ts: string): Promise<unknown> =>
+  getTestDbClient().query('UPDATE feed_posts SET created_at = $1::timestamptz WHERE id = $2', [ts, id])
 
 const postInput = (overrides: Partial<FeedPostInput> = {}): FeedPostInput => ({
   activity_id: null,
@@ -154,8 +159,27 @@ describe('Feed posts integration', () => {
     expect(page1.map((p) => p.id)).toEqual([ids[2], ids[1]])
 
     const last = page1[page1.length - 1]!
-    const page2 = await listFeedPosts(user, 2, { created_at: last.created_at, id: last.id })
+    const page2 = await listFeedPosts(user, 2, { created_at: last.cursor_ts, id: last.id })
     expect(page2.map((p) => p.id)).toEqual([ids[0]])
+  })
+
+  test('pages losslessly across posts sharing a millisecond (#1025)', async () => {
+    const user = getTestUser()
+    const a = await createFeedPost(user, postInput())
+    const b = await createFeedPost(user, postInput())
+    // Same millisecond, different microsecond — the exact case a ms-truncated
+    // cursor drops: `b` is `> cursor_ms` and would be skipped by every page.
+    await setCreatedAt(a.id, '2026-08-20 09:00:00.500700+00')
+    await setCreatedAt(b.id, '2026-08-20 09:00:00.500200+00')
+
+    const page1 = await listFeedPosts(user, 1)
+    expect(page1.map((p) => p.id)).toEqual([a.id])
+    // The cursor carries Postgres' own µs rendering, not a JS Date.
+    expect(page1[0].cursor_ts).toContain('.5007')
+
+    const last = page1[0]
+    const page2 = await listFeedPosts(user, 1, { created_at: last.cursor_ts, id: last.id })
+    expect(page2.map((p) => p.id)).toEqual([b.id])
   })
 
   test('updates selected fields and leaves others intact', async () => {
@@ -234,6 +258,42 @@ describe('Feed posts integration', () => {
       await createFeedPost(user, postInput({ visibility: 'followers' }))
       expect(await listPublicFeedPosts(user)).toEqual([])
       expect(await countPublicFeedPosts(user)).toBe(0)
+    })
+
+    test('listPublicFeedPostsKeyset pages the profile listing by (created_at, id) (#1055)', async () => {
+      const user = getTestUser()
+      const a = await createFeedPost(user, postInput())
+      const b = await createFeedPost(user, postInput())
+      const c = await createFeedPost(user, postInput())
+      await createFeedPost(user, postInput({ visibility: 'followers' }))
+
+      const page1 = await listPublicFeedPostsKeyset(user, 2)
+      expect(page1.map((p) => p.id)).toEqual([c.id, b.id])
+
+      const last = page1[page1.length - 1]
+      const page2 = await listPublicFeedPostsKeyset(user, 2, { created_at: last.cursor_ts, id: last.id })
+      expect(page2.map((p) => p.id)).toEqual([a.id])
+      expect(
+        await listPublicFeedPostsKeyset(user, 2, {
+          created_at: page2[0].cursor_ts,
+          id: page2[0].id,
+        }),
+      ).toEqual([])
+    })
+
+    test('listPublicFeedPostsKeyset hides replies when asked, like the profile tab does', async () => {
+      const user = getTestUser()
+      const share = await createFeedPost(user, postInput())
+      const reply = await createReplyPost(user, {
+        in_reply_to_actor_uri: 'https://mastodon.example/users/alice',
+        in_reply_to_uri: 'https://mastodon.example/statuses/1',
+        message: 'Nice!',
+        visibility: 'public',
+      })
+      expect((await listPublicFeedPostsKeyset(user, 10)).map((p) => p.id)).toEqual([reply.id, share.id])
+      expect(
+        (await listPublicFeedPostsKeyset(user, 10, undefined, { includeReplies: false })).map((p) => p.id),
+      ).toEqual([share.id])
     })
 
     test('listPublicFeedPostsPage returns newest-first pages by limit/offset', async () => {

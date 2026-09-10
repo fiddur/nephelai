@@ -17,16 +17,19 @@ import {
   type FeedPostsResponse,
   type FeedPostStructuredResponse,
   type FeedStructuredPost,
+  type PublicPostsQuery,
+  publicPostsQuerySchema,
   type PublicSeriesQuery,
   publicSeriesQuerySchema,
   type PublicSeriesResponse,
 } from '@aurboda/api-spec'
 
 import { isValidUsername } from '../api/auth-routes.ts'
-import { findCoveringSharedSeriesWindow, isMissingDatabase, listPublicFeedPostsPage } from '../db/index.ts'
+import { findCoveringSharedSeriesWindow, isMissingDatabase, listPublicFeedPostsKeyset } from '../db/index.ts'
 import { resolvePublicSeries } from '../services/feed-series.ts'
 import { loadAuthorizedStructuredPost, resolveStructuredContent } from '../services/feed-structured.ts'
 import { serializeFeedPost } from '../services/feed.ts'
+import { decodeKeysetCursor, encodeKeysetCursor } from '../services/keyset-cursor.ts'
 import { queryMetricsBucketed } from '../services/queries/index.ts'
 import { getSettings } from '../services/settings.ts'
 import { type TypedRouter, typedRouter } from '../typed-router.ts'
@@ -36,10 +39,10 @@ import { createRenderCache } from './feed-image-router.ts'
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /**
- * Most recent public/unlisted posts returned for a profile's feed (newest-first).
- * Matches the authed `/feed` page size: each post can carry a full structured
- * payload (bucketed series + GPS route), and the client builds a chart/map per
- * card, so the one-shot unauthenticated page must stay small.
+ * Page size of a profile's public feed listing (newest-first). Matches the authed
+ * `/feed`: each post can carry a full structured payload (bucketed series + GPS
+ * route), and the client builds a chart/map per card, so one unauthenticated
+ * page must stay small — `next_cursor` reaches the rest (#1055).
  */
 const PROFILE_FEED_LIMIT = 20
 
@@ -105,42 +108,59 @@ export const createFeedPublicRouter = (): TypedRouter => {
   // from the profile immediately, never linger in a shared cache. Mounted before
   // the generic `/public/:username/:slug` resolver so `posts` is never mistaken
   // for a share slug.
-  router.get<{ username: string }, FeedPostsResponse>('/public/:username/posts', async (req, res) => {
-    const { username } = req.params
-    // The response reuses the authed `/feed` shape (which requires `posts`), so a
-    // 404 carries an empty list rather than a bare error body.
-    if (!isValidUsername(username)) {
-      return res.status(404).json({ error: 'Not found', posts: [], success: false })
-    }
-    try {
-      // Replies are excluded here (the outbox still lists them): Mastodon's own
-      // default profile tab hides replies, and a bare comment lifted out of its
-      // thread reads as noise on a profile.
-      const records = await listPublicFeedPostsPage(username, PROFILE_FEED_LIMIT, 0, {
-        includeReplies: false,
-      })
-      const settings = await getSettings(username).catch(() => null)
-      const hourBucket = Math.floor(Date.now() / 3_600_000)
-      const posts = await Promise.all(
-        records.map(async (record) => {
-          const post = await serializeFeedPost(username, record, { settings })
-          if (record.kind === 'activity') {
-            const key = `structured:${username}:${record.id}:${record.updated_at.getTime()}:${hourBucket}`
-            post.structured =
-              (await structuredCache(key, () => resolveStructuredContent(username, record))) ?? undefined
-          }
-          return post
-        }),
-      )
-      res.setHeader('Cache-Control', 'no-store')
-      res.json({ posts, success: true })
-    } catch (error) {
-      if (isMissingDatabase(error)) {
+  router.get<{ username: string }, FeedPostsResponse, unknown, PublicPostsQuery>(
+    '/public/:username/posts',
+    validateQuery(publicPostsQuerySchema),
+    async (req, res) => {
+      const { username } = req.params
+      // The response reuses the authed `/feed` shape (which requires `posts`), so a
+      // 404 carries an empty list rather than a bare error body.
+      if (!isValidUsername(username)) {
         return res.status(404).json({ error: 'Not found', posts: [], success: false })
       }
-      throw error
-    }
-  })
+      try {
+        // Replies are excluded here (the outbox still lists them): Mastodon's own
+        // default profile tab hides replies, and a bare comment lifted out of its
+        // thread reads as noise on a profile.
+        const decoded = decodeKeysetCursor(req.query.cursor)
+        // One row past the page: enough to know whether a next page exists,
+        // without a second count query (as in `getFeedPage`).
+        const rows = await listPublicFeedPostsKeyset(
+          username,
+          PROFILE_FEED_LIMIT + 1,
+          decoded && { created_at: decoded.ts, id: decoded.id },
+          { includeReplies: false },
+        )
+        const hasMore = rows.length > PROFILE_FEED_LIMIT
+        const records = hasMore ? rows.slice(0, PROFILE_FEED_LIMIT) : rows
+        const last = records[records.length - 1]
+        const settings = await getSettings(username).catch(() => null)
+        const hourBucket = Math.floor(Date.now() / 3_600_000)
+        const posts = await Promise.all(
+          records.map(async (record) => {
+            const post = await serializeFeedPost(username, record, { settings })
+            if (record.kind === 'activity') {
+              const key = `structured:${username}:${record.id}:${record.updated_at.getTime()}:${hourBucket}`
+              post.structured =
+                (await structuredCache(key, () => resolveStructuredContent(username, record))) ?? undefined
+            }
+            return post
+          }),
+        )
+        res.setHeader('Cache-Control', 'no-store')
+        res.json({
+          next_cursor: hasMore && last ? encodeKeysetCursor(last.cursor_ts, last.id) : null,
+          posts,
+          success: true,
+        })
+      } catch (error) {
+        if (isMissingDatabase(error)) {
+          return res.status(404).json({ error: 'Not found', posts: [], success: false })
+        }
+        throw error
+      }
+    },
+  )
 
   // The native structured post (typed metrics + inline series) another Aurboda
   // instance fetches on ingest to render a chart. Same data-scoping as `/series`

@@ -470,9 +470,22 @@ export const feedPostsQuerySchema = z
 export type FeedPostsQuery = z.infer<typeof feedPostsQuerySchema>
 
 /**
- * Response wrapping a list of feed posts. The owner's `GET /feed` pages with
- * `next_cursor` (null on the last page); the bounded public-profile listing
- * omits it.
+ * Query for the UNAUTHENTICATED public profile listing (#1055). Only a cursor:
+ * the page size is fixed server-side, since each post carries a full structured
+ * payload.
+ */
+export const publicPostsQuerySchema = z
+  .object({
+    cursor: z.string().optional().meta({ description: "Opaque cursor from a previous page's `next_cursor`" }),
+  })
+  .meta({ id: 'PublicPostsQuery' })
+
+export type PublicPostsQuery = z.infer<typeof publicPostsQuerySchema>
+
+/**
+ * Response wrapping a list of feed posts. Both the owner's `GET /feed` and the
+ * public profile listing page with `next_cursor` (null on the last page); it is
+ * absent only where a surface returns everything at once.
  */
 export const feedPostsResponseSchema = baseResponseSchema
   .extend({

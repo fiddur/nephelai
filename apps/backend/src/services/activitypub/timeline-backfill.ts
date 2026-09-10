@@ -127,8 +127,9 @@ export const createTimelineBackfiller = (
   const deps: BackfillDeps = {
     fetchRecentNotes: (actorUri, limit) => fetchRecentOutboxNotes(federation, origin, actorUri, limit),
     getFollowee: getFeedFollowingByActor,
-    ingestNote: (user, note, followee) =>
-      ingestNoteForRecipient(user, note, followee, enrich, undefined, origin),
+    ingestNote: async (user, note, followee) => {
+      await ingestNoteForRecipient(user, note, followee, enrich, origin)
+    },
   }
   return (user, actorUri) => {
     void withTimeout(backfillFolloweeTimeline(deps, user, actorUri), BACKFILL_TIMEOUT_MS)

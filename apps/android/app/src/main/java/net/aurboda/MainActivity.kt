@@ -169,9 +169,6 @@ class MainActivity : ComponentActivity() {
     val link = deepLinkFrom(intent)
     setContent {
       AurbodaAppShell {
-        // Reconcile the Feed page's per-account notification bells with the
-        // device: request the permission + start the poller when bells are on
-        // but no explicit choice was ever made (#1060).
         AutoEnablePostNotifications()
         AurbodaApp(initialTab = link?.tab, initialMorePath = link?.morePath, deepLinkEvent = runningDeepLink)
       }

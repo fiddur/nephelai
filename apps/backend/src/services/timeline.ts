@@ -13,6 +13,7 @@ import type {
   FeedReactionState,
   TimelineCursor,
   TimelineEntryRecord,
+  TimelinePageRow,
   TimelineReplyFilter,
 } from '../db/index.ts'
 
@@ -90,7 +91,7 @@ export type TimelineFetcher = (
   limit: number,
   cursor?: TimelineCursor,
   replies?: TimelineReplyFilter,
-) => Promise<TimelineEntryRecord[]>
+) => Promise<TimelinePageRow[]>
 
 /** The URI prefix of a user's own post objects on this instance. */
 export const ownObjectPrefix = (origin: string, user: string): string =>
@@ -163,6 +164,6 @@ export const getTimelinePage = async (
   const reactions = await loadReactionsForRows(user, page, opts.fetchReactions)
   return {
     entries: page.map((row) => serializeTimelineEntry(row, prefix, reactions)),
-    next_cursor: hasMore && last ? encodeKeysetCursor(last.published_at, last.id) : null,
+    next_cursor: hasMore && last ? encodeKeysetCursor(last.cursor_ts, last.id) : null,
   }
 }

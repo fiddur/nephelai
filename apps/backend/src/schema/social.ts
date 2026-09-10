@@ -233,6 +233,13 @@ export const socialTables: Record<string, string> = {
     CREATE INDEX IF NOT EXISTS idx_feed_posts_created ON feed_posts (created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_feed_posts_series ON feed_posts USING GIN (series_metrics)
   `,
+  // The keyset page predicate is row-wise (`(created_at, id) < (…)`), which
+  // needs a multicolumn index in the SAME order to seek instead of scanning
+  // `idx_feed_posts_created` and filtering (#1023). The timeline has the
+  // equivalent one on `(published_at DESC, id DESC)`.
+  feed_posts_keyset_index: `
+    CREATE INDEX IF NOT EXISTS idx_feed_posts_created_id ON feed_posts (created_at DESC, id DESC)
+  `,
 
   // Tombstones for deleted public/unlisted feed posts. A post row is hard-deleted
   // on unshare, but a remote server may still dereference its object id; AS2 wants
@@ -428,6 +435,23 @@ export const socialTables: Record<string, string> = {
     CREATE INDEX IF NOT EXISTS idx_timeline_entry_in_reply_to
       ON timeline_entry (in_reply_to_uri, published_at, id)
       WHERE in_reply_to_uri IS NOT NULL
+  `,
+  // Partial index for the lazy reply/Mention backfill's candidate query
+  // (#1062), like the retro-enrichment one above: once the legacy backlog
+  // drains it is empty, so the no-work case on a timeline read stays cheap.
+  timeline_entry_reply_unchecked_indexes: `
+    CREATE INDEX IF NOT EXISTS idx_timeline_entry_reply_unchecked
+      ON timeline_entry (received_at DESC)
+      WHERE reply_checked_at IS NULL
+  `,
+  // A boost card is found by the Note it announces, not by its own object id:
+  // an author's `Delete` / `Update` of a post has to reach every boost of it,
+  // and `object_uri = $1 OR boost_of_uri = $1` can't use the object_uri unique
+  // index (#1105).
+  timeline_entry_boost_indexes: `
+    CREATE INDEX IF NOT EXISTS idx_timeline_entry_boost_of
+      ON timeline_entry (boost_of_uri)
+      WHERE boost_of_uri IS NOT NULL
   `,
 
   // The user's OWN outbound reactions: a `Like` (favourite) or `Announce`

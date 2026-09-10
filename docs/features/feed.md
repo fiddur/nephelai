@@ -243,17 +243,23 @@ actor's new home-timeline posts; muting is preserved across a re-follow.
 `timeline_entry.in_reply_to_uri` and whether it carries a `Mention` of the timeline owner as
 `mentions_me`. The timeline exposes both (plus `in_reply_to_mine`, true when the reply target
 is one of the reader's own posts) and filters by the **`timeline_show_replies`** user setting
-(toggle on the Feed page and in Settings): off (the default) hides followed actors' replies
-to *other* people — posts the reader is **involved** in (replies to their own posts, Mentions
-of them) always show, marked on the card. The inbox admits an involvement Note **from any
-actor**, not only followees (a stranger's reply to your post, or a post mentioning you, is
-the Mastodon-style interaction; the author snapshot comes from the signature-verified sender)
-— everything else from non-followees is still dropped. The Android notifier follows the same
+(toggle on the Feed page and in Settings): off (the default) hides only replies to posts that
+**aren't in the reader's timeline**. A reply to a post the timeline already holds — a followee
+continuing their own thread, or two followees talking to each other — stays visible, which is
+what Mastodon's home shows; so do posts the reader is **involved** in (replies to their own
+posts, Mentions of them), marked on the card, and boost cards of replies. The inbox admits an
+involvement Note **from any actor**, not only followees (a stranger's reply to your post, or a
+post mentioning you, is the Mastodon-style interaction; the author snapshot comes from the
+signature-verified sender) — everything else from non-followees is still dropped. The live
+"new post" ping applies the same filter (#1062): a reply the reader has chosen not to see
+never announces a card their timeline doesn't list. The Android notifier follows the same
 rule: top-level posts notify per the per-follow bell, involvement notifies regardless of who
-wrote it. Entries also expose **`received_at`** (when this instance stored the post) — the
-notifier's high-water mark, since `published_at` can arrive out of order after federation
-retries. Entries ingested before this shipped are **lazily backfilled**: each timeline read
-re-fetches a few unchecked objects (SSRF-guarded) and stamps their reply/Mention state.
+wrote it — deliberately including an account whose bell is explicitly OFF, since a reply to
+you or a mention of you is addressed to you, not merely published near you. Entries also
+expose **`received_at`** (when this instance stored the post) — the notifier's high-water
+mark, since `published_at` can arrive out of order after federation retries. Entries ingested
+before this shipped are **lazily backfilled**: each timeline read re-fetches a few unchecked
+objects (SSRF-guarded) and stamps their reply/Mention state.
 
 **Expanding a thread**: `GET /feed/timeline/:id/replies` (and the MCP `get_timeline_replies`
 tool) fetches a live, bounded snapshot of the post's remote `replies` collection — at most 20
@@ -341,8 +347,11 @@ shows its photos.
 A `Delete` removes the matching entry; unfollowing removes all of that actor's entries. The
 timeline is read back **newest-first**, keyset-paginated on `(published_at, id)` behind an
 opaque `next_cursor` — the same cursor style as the outbox — via `GET /feed/timeline` and the
-`list_timeline` MCP tool. Because the content was sanitised on ingest, the web client renders
-it directly.
+`list_timeline` MCP tool. The cursor carries the timestamp at Postgres' own **microsecond**
+precision (selected as text alongside the row), because the page predicate compares at that
+precision: a millisecond-rounded cursor made a row sharing that millisecond unreachable from
+every page (#1025). Cursors issued before that fix are still accepted, at their old precision.
+Because the content was sanitised on ingest, the web client renders it directly.
 
 Two ingest guards keep the timeline honest given `object_uri` is a **globally-unique** upsert
 key: the note's id must be on the **sender's host** *and* it must declare `attributedTo` naming
@@ -722,9 +731,10 @@ resolving.
   what they shared. The listing is **keyset-paginated** (20 per page, "Load more" — the same
   cursor style as the home timeline), so the inline payload weight stays bounded per request
   however many posts exist (#1012). The **public profile** (`/u/:username`) attaches the same
-  full structured payload per post (through the per-post LRU the structured endpoint shares,
-  one fixed page of 20), so visitors see the identical native card. The MCP `list_feed` tool
-  remains the one surface that omits `structured` (an intentional payload-weight divergence
+  full structured payload per post (through the per-post LRU the structured endpoint shares),
+  and pages the same way — 20 per page with a "Load more" driven by `next_cursor` (#1055) — so
+  visitors see the identical native card and can reach every public post. The MCP `list_feed`
+  tool remains the one surface that omits `structured` (an intentional payload-weight divergence
   from `GET /feed`, not a capability gap: the underlying data is all reachable via the
   metric-query tools).
 - **New article** — the **Feed** page has a **New article** button that opens the article
@@ -801,7 +811,7 @@ Public / federation (unauthenticated):
 | `GET /public/:username/feed/:postId/route.png`               | Rendered GPS route map for an opted-in post (`?token=` for followers-only)                                 |
 | `GET /public/:username/feed/:postId/blocks/:index/image.png` | Rendered PNG of an article's chart/correlation block (visibility-gated; `?token=` for followers-only)      |
 | `GET /public/:username/feed/:postId/blocks/:index/image.svg` | Same article block as crisp `image/svg+xml`                                                                |
-| `GET /public/:username/posts`                                | A user's public/unlisted posts (newest-first, latest page) for their profile feed                          |
+| `GET /public/:username/posts`                                | A user's public/unlisted posts (newest-first, keyset page of 20 + `next_cursor`) for their profile feed    |
 | `GET /.well-known/webfinger`                                 | Resolve `acct:<username>@<host>` → the actor                                                               |
 | `GET /.well-known/quantpub`                                  | QuantPub discovery document (FEP §4): product, versions, `api_base`                                        |
 | `GET /ns/quantpub`                                           | The published QuantPub JSON-LD `@context` document (`application/ld+json`)                                 |

@@ -38,6 +38,7 @@ import {
 } from '@aurboda/api-spec'
 
 import type { Activity, FeedPostRecord } from '../db/index.ts'
+import type { ResolvedInbox } from '../services/activitypub/deliver.ts'
 import type { ReactionActions, ReactionResult } from '../services/feed-reactions.ts'
 import type { TimelineHub } from '../services/timeline-hub.ts'
 import type { RetroEnrichTrigger } from '../services/timeline-retro-enrich.ts'
@@ -97,8 +98,11 @@ export interface FeedDeliver {
   createdChallenge: (user: string, post: FeedPostRecord) => void
   /** Federate a challenge-share edit as an `Update`. */
   updatedChallenge: (user: string, post: FeedPostRecord) => void
-  /** Fan a fresh reply out to followers AND the inbox of the author it answers. */
-  createdReply: (user: string, post: FeedPostRecord) => void
+  /**
+   * Fan a fresh reply out to followers AND the inbox of the author it answers —
+   * `authorInbox` being the one the reply handler already resolved (#1108).
+   */
+  createdReply: (user: string, post: FeedPostRecord, authorInbox?: ResolvedInbox) => void
   /** Federate a reply edit as an `Update`, to the same recipients. */
   updatedReply: (user: string, post: FeedPostRecord) => void
 }
