@@ -5,6 +5,8 @@
  * functions to enable automatic data refresh before queries.
  */
 
+import type { GravlSyncResult } from '@aurboda/api-spec'
+
 import { isBefore, subDays, subMinutes } from 'date-fns'
 
 import type { SyncIntervals, SyncState } from '../db/types.ts'
@@ -40,6 +42,10 @@ import {
 } from '../integrations/rescuetime/sync.ts'
 import { auditError, auditInfo, auditWarn } from './audit-log.ts'
 import { getSettings } from './settings.ts'
+
+/** A Gravl run that stored, enriched or retracted activities — the deduction hook should re-run over its window. */
+const gravlChangedActivities = (result: GravlSyncResult): boolean =>
+  result.status === 'success' && (result.workouts_processed > 0 || result.activities_retracted > 0)
 
 /** Default sync threshold - sync if last sync was more than 30 minutes ago */
 export const DEFAULT_SYNC_THRESHOLD_MINUTES = 30
@@ -201,7 +207,7 @@ export function createSyncProvider(config: SyncProviderConfig): SyncProvider {
         auditInfo(user, 'sync', 'Auto-syncing Gravl workouts')
         const windowStart = syncState?.last_sync_time ?? subDays(now, GRAVL_HISTORY_DAYS)
         const result = await syncGravlWorkouts(user, config.gravl)
-        if (result.status === 'success' && result.workouts_processed > 0) {
+        if (gravlChangedActivities(result)) {
           config.onActivitySynced?.(user, '*', windowStart, now)
         }
       } catch (error) {

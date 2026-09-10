@@ -9,13 +9,22 @@
  */
 
 /**
+ * Enum casing: the OpenAPI spec declares these names in PascalCase, but the
+ * live API serializes them in lowercase (`"type": "external"`,
+ * `"setType": "warmup"`). Both spellings are admitted here and every
+ * comparison in process.ts is case-insensitive.
+ */
+type GravlWorkoutTypeName = 'Today' | 'Custom' | 'Saved' | 'New' | 'Public' | 'External' | 'NewSaved'
+type GravlSetTypeName = 'Normal' | 'Warmup' | 'DropSet' | 'Failure'
+
+/**
  * `External` workouts are Health Connect sessions round-tripped INTO Gravl
  * from other apps (Garmin, Polar, …). They carry no exercise data and must be
  * dropped, otherwise every watch session would gain a third copy.
  */
-export type GravlWorkoutType = 'Today' | 'Custom' | 'Saved' | 'New' | 'Public' | 'External' | 'NewSaved'
+export type GravlWorkoutType = GravlWorkoutTypeName | Lowercase<GravlWorkoutTypeName>
 
-export type GravlSetType = 'Normal' | 'Warmup' | 'DropSet' | 'Failure'
+export type GravlSetType = GravlSetTypeName | Lowercase<GravlSetTypeName>
 
 export interface GravlSet {
   order: number

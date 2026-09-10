@@ -6,11 +6,13 @@ import type { GravlWorkoutDetail, GravlWorkoutSummary } from './types.ts'
 
 vi.mock('../../db/index.ts', () => ({
   adoptLegacyActivity: vi.fn(),
+  deleteActivity: vi.fn(),
   findActivityByExternalId: vi.fn(),
   getAllSyncStates: vi.fn(),
   getSyncState: vi.fn(),
   insertActivity: vi.fn(),
   insertRawRecord: vi.fn(),
+  materializeSuperseded: vi.fn(),
   upsertSyncState: vi.fn(),
 }))
 vi.mock('../../db/notes.ts', () => ({ upsertSyncedNote: vi.fn() }))
@@ -56,7 +58,16 @@ const makeClient = (overrides: Partial<GravlClient> = {}): GravlClient =>
   ({
     getAccessToken: vi.fn().mockResolvedValue('gat'),
     getWorkout: vi.fn(async (_token: string, id: string) => detailOf(id)),
-    listWorkouts: vi.fn().mockResolvedValue(page([summary('a'), summary('ext', 'External'), summary('b')])),
+    listWorkouts: vi
+      .fn()
+      .mockResolvedValue(
+        page([
+          summary('a'),
+          summary('ext', 'external'),
+          { ...summary('empty'), exerciseCount: 0 },
+          summary('b'),
+        ]),
+      ),
     ...overrides,
   }) as unknown as GravlClient
 
@@ -70,13 +81,14 @@ const makeDeps = (
     getSyncState: vi.fn().mockResolvedValue(state),
     now: () => NOW,
     processWorkout: vi.fn(async (_user, detail) => outcomes[detail.id] ?? 'created'),
+    retractWorkout: vi.fn(async (_user, workoutId) => workoutId === 'ext'),
     upsertSyncState: vi.fn(),
   }
   return deps
 }
 
 describe('syncGravlWorkouts', () => {
-  it('lists the first-sync window, skips external workouts, fetches detail and counts outcomes', async () => {
+  it('lists the first-sync window, skips external and empty workouts, fetches detail and counts outcomes', async () => {
     const client = makeClient()
     const deps = makeDeps(null, { a: 'enriched', b: 'created' })
 
@@ -85,9 +97,13 @@ describe('syncGravlWorkouts', () => {
     expect(result).toEqual({
       activities_created: 1,
       activities_enriched: 1,
+      activities_retracted: 1,
       status: 'success',
       workouts_processed: 2,
     })
+    expect(deps.retractWorkout).toHaveBeenCalledWith('alice', 'ext')
+    expect(deps.retractWorkout).toHaveBeenCalledWith('alice', 'empty')
+    expect(deps.retractWorkout).toHaveBeenCalledTimes(2)
     expect(client.listWorkouts).toHaveBeenCalledWith('gat', {
       endDate: NOW,
       page: 1,
@@ -95,6 +111,7 @@ describe('syncGravlWorkouts', () => {
     })
     expect(client.getWorkout).toHaveBeenCalledTimes(2)
     expect(client.getWorkout).not.toHaveBeenCalledWith('gat', 'ext')
+    expect(client.getWorkout).not.toHaveBeenCalledWith('gat', 'empty')
     expect(deps.upsertSyncState).toHaveBeenLastCalledWith('alice', {
       data_type: 'workouts',
       error_message: undefined,

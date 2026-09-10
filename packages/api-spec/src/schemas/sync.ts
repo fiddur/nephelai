@@ -456,13 +456,16 @@ export const gravlSyncResultSchema = z
       .number()
       .int()
       .meta({ description: 'Existing Health Connect sessions enriched with Gravl set detail' }),
+    activities_retracted: z.number().int().meta({
+      description:
+        'Empty activities an earlier run imported for external or exercise-less workouts, now soft-deleted',
+    }),
     error: z.string().optional().meta({ description: 'Error message if status is error' }),
     retry_after: iso8601DateTimeSchema.optional().meta({ description: 'Time when retry is allowed' }),
     status: syncResultStatusSchema,
-    workouts_processed: z
-      .number()
-      .int()
-      .meta({ description: 'Real (non-external) Gravl workouts seen in the sync window' }),
+    workouts_processed: z.number().int().meta({
+      description: 'Real Gravl workouts (logged in Gravl, with at least one set) seen in the sync window',
+    }),
   })
   .meta({ id: 'GravlSyncResult' })
 

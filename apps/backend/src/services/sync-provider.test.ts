@@ -296,6 +296,7 @@ describe('createSyncProvider › syncGravlIfNeeded', () => {
     vi.mocked(syncGravlWorkouts).mockResolvedValue({
       activities_created: 0,
       activities_enriched: 2,
+      activities_retracted: 0,
       status: 'success',
       workouts_processed: 2,
     })

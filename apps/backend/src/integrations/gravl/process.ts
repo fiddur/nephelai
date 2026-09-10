@@ -12,6 +12,12 @@
  * (`exercise`, `weight` in kg, `reps`, `time` in seconds) plus Gravl's extras.
  * A human-readable rendering also goes into a synced note so the detail is
  * visible before the UI can render set arrays.
+ *
+ * Only workouts logged in Gravl itself with at least one exercise are
+ * imported (`isStrengthWorkout`). Gravl also lists every session it read from
+ * Health Connect as an `External` workout; importing those would give each
+ * watch activity an empty strength_training twin that outranks the original
+ * in the cross-source merge.
  */
 
 import type { Activity, RawRecord } from '../../db/types.ts'
@@ -19,9 +25,11 @@ import type { GravlSet, GravlWorkoutDetail, GravlWorkoutExercise, GravlWorkoutSu
 
 import {
   adoptLegacyActivity,
+  deleteActivity,
   findActivityByExternalId,
   insertActivity,
   insertRawRecord,
+  materializeSuperseded,
 } from '../../db/index.ts'
 import { upsertSyncedNote } from '../../db/notes.ts'
 import { GRAVL_HC_ORIGIN, gravlWorkoutExternalId } from '../../services/source-identity.ts'
@@ -52,31 +60,55 @@ export interface GravlSetRecord {
 
 export interface GravlProcessDeps {
   adoptLegacyActivity: typeof adoptLegacyActivity
+  deleteActivity: typeof deleteActivity
   findActivityByExternalId: typeof findActivityByExternalId
   insertActivity: typeof insertActivity
   insertRawRecord: typeof insertRawRecord
+  materializeSuperseded: typeof materializeSuperseded
   upsertSyncedNote: typeof upsertSyncedNote
 }
 
 const defaultDeps: GravlProcessDeps = {
   adoptLegacyActivity,
+  deleteActivity,
   findActivityByExternalId,
   insertActivity,
   insertRawRecord,
+  materializeSuperseded,
   upsertSyncedNote,
 }
 
+/**
+ * Gravl's OpenAPI spec declares its enums in PascalCase (`External`,
+ * `DropSet`) but the live API serializes them lowercase (`external`,
+ * `dropset`), so every enum comparison goes through this.
+ */
+const enumValue = (value: string): string => value.toLowerCase()
+
 /** Health Connect sessions round-tripped into Gravl from other apps carry no sets and must not be imported. */
 export const isExternalWorkout = (workout: Pick<GravlWorkoutSummary, 'type'>): boolean =>
-  workout.type === 'External'
+  enumValue(workout.type) === 'external'
+
+/**
+ * A workout worth importing: logged in Gravl itself and holding at least one
+ * exercise with a set. Anything else — an External round-trip of a watch
+ * session, or a workout started and abandoned — carries nothing Aurboda does
+ * not already have, and importing it would override the original's type.
+ */
+export const isStrengthWorkout = (workout: GravlWorkoutSummary | GravlWorkoutDetail): boolean => {
+  if (isExternalWorkout(workout)) return false
+  return 'exercises' in workout
+    ? workout.exercises.some((exercise) => exercise.sets.length > 0)
+    : workout.exerciseCount > 0
+}
 
 const setKind = (setType: GravlSet['setType']): GravlSetKind => {
-  switch (setType) {
-    case 'Warmup':
+  switch (enumValue(setType)) {
+    case 'warmup':
       return 'warmup'
-    case 'DropSet':
+    case 'dropset':
       return 'drop_set'
-    case 'Failure':
+    case 'failure':
       return 'failure'
     default:
       return 'normal'
@@ -161,7 +193,7 @@ export const buildGravlActivity = (detail: GravlWorkoutDetail): Activity => {
       set_count: sets.length,
       sets,
       volume_kg: positive(detail.volume) === null ? 0 : lbToKg(detail.volume),
-      workout_type: detail.type,
+      workout_type: enumValue(detail.type),
     },
     end_time: new Date(detail.endDate),
     external_id: gravlWorkoutExternalId(detail.id),
@@ -182,9 +214,47 @@ export const buildGravlRawRecord = (detail: GravlWorkoutDetail): RawRecord => ({
 /**
  * `enriched`: a row that reached us another way (Health Connect) gained its
  * sets; `updated`: a row Gravl itself wrote earlier was re-processed;
- * `created`: nothing existed for the workout; `skipped`: an External round-trip.
+ * `created`: nothing existed for the workout; `skipped`: not a strength
+ * workout (External round-trip or no exercises) and nothing to undo;
+ * `retracted`: not a strength workout, and the empty row an earlier run
+ * imported for it was soft-deleted.
  */
-export type GravlProcessOutcome = 'enriched' | 'updated' | 'created' | 'skipped'
+export type GravlProcessOutcome = 'enriched' | 'updated' | 'created' | 'skipped' | 'retracted'
+
+/**
+ * The footprint of the import itself: a row whose `data.sets` it wrote and
+ * left empty. A Health Connect session stored under the Gravl identity has
+ * no `sets` key until enriched, and an enriched row has a non-empty one.
+ */
+const isImportedWithoutSets = (activity: Activity): boolean => {
+  const sets = activity.data?.sets
+  return Array.isArray(sets) && sets.length === 0
+}
+
+/**
+ * Soft-delete the activity an earlier run imported for a workout that
+ * `isStrengthWorkout` rejects. Until 2026-09-09 the External check compared
+ * PascalCase against Gravl's lowercase JSON, so every watch session Gravl had
+ * read from Health Connect came back as an empty `strength_training` row that
+ * outranked the Garmin original in the cross-source merge. Only rows the
+ * import wrote (an empty `data.sets`) are touched, and supersession is
+ * recomputed so the original resurfaces. Returns true when a row was
+ * retracted.
+ */
+export const retractGravlNonWorkout = async (
+  user: string,
+  workoutId: string,
+  deps: Pick<
+    GravlProcessDeps,
+    'deleteActivity' | 'findActivityByExternalId' | 'materializeSuperseded'
+  > = defaultDeps,
+): Promise<boolean> => {
+  const existing = await deps.findActivityByExternalId(user, 'gravl', gravlWorkoutExternalId(workoutId))
+  if (!existing?.id || !isImportedWithoutSets(existing)) return false
+  const deleted = await deps.deleteActivity(user, existing.id)
+  if (deleted) await deps.materializeSuperseded(user, existing.start_time)
+  return deleted
+}
 
 /**
  * Store one Gravl workout. Claims the Health Connect copy of the session
@@ -197,7 +267,9 @@ export const processGravlWorkout = async (
   detail: GravlWorkoutDetail,
   deps: GravlProcessDeps = defaultDeps,
 ): Promise<GravlProcessOutcome> => {
-  if (isExternalWorkout(detail)) return 'skipped'
+  if (!isStrengthWorkout(detail)) {
+    return (await retractGravlNonWorkout(user, detail.id, deps)) ? 'retracted' : 'skipped'
+  }
 
   const activity = buildGravlActivity(detail)
   const externalId = activity.external_id!

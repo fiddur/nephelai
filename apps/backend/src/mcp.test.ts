@@ -75,6 +75,8 @@ vi.mock('./db', () => ({
   upsertUserSettings: vi.fn(),
   adoptLegacyActivity: vi.fn(),
   findActivityByExternalId: vi.fn(),
+  deleteActivity: vi.fn().mockResolvedValue(false),
+  materializeSuperseded: vi.fn().mockResolvedValue(undefined),
 }))
 
 // Mock the sync modules
