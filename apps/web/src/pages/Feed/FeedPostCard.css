@@ -160,6 +160,8 @@
   justify-content: flex-end;
   gap: 0.5rem;
   margin-top: 0.75rem;
+  /* The expanded "who reacted" list takes a full-width row of its own. */
+  flex-wrap: wrap;
 }
 
 /* Article posts: title + prose/chart blocks rendered inline in the card. */
@@ -328,4 +330,139 @@
   font-size: 0.85rem;
   color: #6b7280;
   margin-bottom: 0.75rem;
+}
+
+/* ---------------------------------------------------------------------------
+ * Likes ⭐ and boosts 🔄 on the home timeline.
+ * ------------------------------------------------------------------------- */
+
+/* Mastodon's "X boosted" line, above the boosted post's own header. */
+.feed-post-boost-marker {
+  margin: 0 0 0.4rem;
+  font-size: 0.8rem;
+  color: #6b7280;
+}
+
+.feed-post-boost-marker a {
+  color: inherit;
+  font-weight: 600;
+}
+
+.feed-post-actions {
+  display: flex;
+  gap: 0.25rem;
+  margin-top: 0.6rem;
+}
+
+.feed-post-action {
+  padding: 0.2rem 0.5rem;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1.2;
+  /* Un-reacted buttons read as available, not as state. */
+  filter: grayscale(1);
+  opacity: 0.55;
+}
+
+.feed-post-action:hover {
+  border-color: #d1d5db;
+  opacity: 0.85;
+}
+
+.feed-post-action.active {
+  filter: none;
+  opacity: 1;
+  background: #fef3c7;
+  border-color: #fde68a;
+}
+
+.feed-post-action--boost.active {
+  background: #d1fae5;
+  border-color: #a7f3d0;
+}
+
+.feed-post-action-error {
+  margin: 0.4rem 0 0;
+  font-size: 0.85rem;
+  padding: 0.4rem 0.6rem;
+}
+
+/* "⭐ 3  🔄 1" chips in the owner's own post footer; expand the reaction list. */
+.feed-post-reaction-chips {
+  display: flex;
+  gap: 0.5rem;
+  margin-right: auto;
+  align-self: center;
+  padding: 0.15rem 0.5rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 999px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: #6b7280;
+}
+
+.feed-post-reactions {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0 0 0 0.25rem;
+  font-size: 0.9rem;
+  /* Its own row under the footer's controls, whatever the DOM order. */
+  flex-basis: 100%;
+  order: 99;
+  text-align: left;
+}
+
+.feed-post-reaction {
+  display: flex;
+  gap: 0.4rem;
+  align-items: baseline;
+  padding: 0.15rem 0;
+}
+
+.feed-post-reaction a {
+  color: inherit;
+}
+
+.feed-post-reaction-handle,
+.feed-post-reactions-status {
+  color: #6b7280;
+  font-size: 0.85rem;
+}
+
+.feed-post-reactions-status {
+  margin: 0.5rem 0 0;
+  flex-basis: 100%;
+  order: 99;
+  text-align: left;
+}
+
+@media (prefers-color-scheme: dark) {
+  .feed-post-boost-marker,
+  .feed-post-reaction-chips,
+  .feed-post-reaction-handle,
+  .feed-post-reactions-status {
+    color: #9ca3af;
+  }
+
+  .feed-post-action:hover {
+    border-color: #4b5563;
+  }
+
+  .feed-post-action.active {
+    background: #4d3c11;
+    border-color: #78350f;
+  }
+
+  .feed-post-action--boost.active {
+    background: #0f3f30;
+    border-color: #065f46;
+  }
+
+  .feed-post-reaction-chips {
+    border-color: #374151;
+  }
 }

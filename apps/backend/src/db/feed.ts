@@ -276,6 +276,9 @@ export const updateFeedPost = async (
  * the tombstone insert commit together. `followers`-only posts leave no tombstone
  * — their id never resolved publicly, so a 410 would leak that a post existed.
  * Idempotent via `ON CONFLICT` (re-deleting a since-recreated id is a no-op).
+ *
+ * The post's inbound like/boost records go with it: `feed_post_reaction.post_id`
+ * is a soft reference (like `activity_id`), so nothing cascades on its own.
  */
 export const deleteFeedPost = async (user: string, id: string): Promise<boolean> => {
   const result = await query<{ id: string }>(
@@ -283,6 +286,8 @@ export const deleteFeedPost = async (user: string, id: string): Promise<boolean>
     `WITH deleted AS (
        DELETE FROM feed_posts WHERE id = $1
        RETURNING id, visibility, activity_id
+     ), reactions AS (
+       DELETE FROM feed_post_reaction WHERE post_id IN (SELECT id FROM deleted)
      ), tomb AS (
        INSERT INTO feed_tombstone (post_id)
        SELECT id FROM deleted WHERE visibility IN ('public', 'unlisted')

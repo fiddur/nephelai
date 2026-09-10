@@ -18,6 +18,7 @@ import {
 import { z } from 'zod'
 
 import type { FeedDeliver } from '../routes/feed-router.ts'
+import type { ReactionActions, ReactionResult } from '../services/feed-reactions.ts'
 import type { FollowerActions } from '../services/followers.ts'
 import type { FollowActions } from '../services/following.ts'
 import type { RetroEnrichTrigger } from '../services/timeline-retro-enrich.ts'
@@ -32,6 +33,7 @@ import {
   getTimelineEntryById,
   listFeedFollowers,
   listFeedFollowing,
+  listFeedPostReactions,
   updateFeedFollowingNotify,
   updateFeedPost,
 } from '../db/index.ts'
@@ -40,6 +42,7 @@ import { fetchRemoteReplies } from '../services/activitypub/remote-replies.ts'
 import { buildArticleMarkdown, renderableArticleBlocks } from '../services/article-export.ts'
 import { buildArticleContent, mergeArticleContent } from '../services/article.ts'
 import { resolveChallengeShare } from '../services/challenge-share.ts'
+import { serializeFeedPostReaction } from '../services/feed-reactions.ts'
 import {
   getFeedPage,
   normalizeFeedMessage,
@@ -60,11 +63,16 @@ const followerStatusFilter = (status: 'accepted' | 'all' | 'pending'): { accepte
   return {}
 }
 
+/** Newest-first cap on the "who liked / boosted this" list (parity with the REST route). */
+const MAX_POST_REACTIONS = 100
+
 /** The injectable collaborators behind the feed tools (all optional). */
 export interface FeedToolsOptions {
   deliver?: FeedDeliver
   followActions?: FollowActions
   followerActions?: FollowerActions
+  /** Outbound like ⭐ / boost 🔄 toggles; absent → those tools report unavailable. */
+  reactionActions?: ReactionActions
   apiBaseUrl?: string
   retroEnrichTimeline?: RetroEnrichTrigger
   /** Canonical web origin, to build a shared challenge's public URL (#994). */
@@ -72,7 +80,19 @@ export interface FeedToolsOptions {
 }
 
 export const registerFeedTools = (server: McpServer, user: string, options: FeedToolsOptions = {}) => {
-  const { apiBaseUrl, deliver, followActions, followerActions, retroEnrichTimeline, webHost } = options
+  const {
+    apiBaseUrl,
+    deliver,
+    followActions,
+    followerActions,
+    reactionActions,
+    retroEnrichTimeline,
+    webHost,
+  } = options
+
+  /** Answer a reaction toggle with the updated entry, or the failure as a tool error. */
+  const reactionResult = (result: ReactionResult) =>
+    result.ok ? jsonResponse(result.entry) : errorResponse(result.error)
   server.tool(
     'list_feed',
     "List posts you have published to your feed, newest first, with their shared metric selection, series opt-in, and visibility. Pass `cursor` (from a previous call's `next_cursor`) to page.",
@@ -275,6 +295,57 @@ export const registerFeedTools = (server: McpServer, user: string, options: Feed
         replies: [],
       }))
       return jsonResponse({ ...result, success: true })
+    },
+  )
+
+  server.tool(
+    'like_timeline_post',
+    "Favourite (AS2 `Like`) a post in your home timeline, by the entry's local `id` from `list_timeline`. Delivers the Like to the post author. Idempotent — liking twice changes nothing. Returns the updated entry (`liked: true`).",
+    { id: z.string().uuid().describe('Home-timeline entry id (the `id` from list_timeline)') },
+    async ({ id }) => {
+      if (!reactionActions) return errorResponse('Reactions are not available')
+      return reactionResult(await reactionActions.like(user, id))
+    },
+  )
+
+  server.tool(
+    'unlike_timeline_post',
+    "Remove your favourite from a home-timeline post (delivers an `Undo{Like}`), by the entry's local `id`. Idempotent — unliking something you never liked changes nothing.",
+    { id: z.string().uuid().describe('Home-timeline entry id (the `id` from list_timeline)') },
+    async ({ id }) => {
+      if (!reactionActions) return errorResponse('Reactions are not available')
+      return reactionResult(await reactionActions.unlike(user, id))
+    },
+  )
+
+  server.tool(
+    'boost_timeline_post',
+    'Boost (AS2 `Announce`, Mastodon "reblog") a post in your home timeline, by the entry\'s local `id` from `list_timeline`. The boost is public and is delivered to your followers AND the post author. Idempotent. Returns the updated entry (`boosted: true`).',
+    { id: z.string().uuid().describe('Home-timeline entry id (the `id` from list_timeline)') },
+    async ({ id }) => {
+      if (!reactionActions) return errorResponse('Reactions are not available')
+      return reactionResult(await reactionActions.boost(user, id))
+    },
+  )
+
+  server.tool(
+    'unboost_timeline_post',
+    "Retract your boost of a home-timeline post (delivers an `Undo{Announce}`), by the entry's local `id`. Idempotent.",
+    { id: z.string().uuid().describe('Home-timeline entry id (the `id` from list_timeline)') },
+    async ({ id }) => {
+      if (!reactionActions) return errorResponse('Reactions are not available')
+      return reactionResult(await reactionActions.unboost(user, id))
+    },
+  )
+
+  server.tool(
+    'list_feed_post_reactions',
+    'List who favourited or boosted one of YOUR feed posts (by feed post id), newest first. Remote servers push these as `Like`/`Announce`; a reaction with no resolvable actor still counts.',
+    { id: z.string().uuid().describe('Feed post ID') },
+    async ({ id }) => {
+      if ((await getFeedPostById(user, id)) == null) return errorResponse('Feed post not found')
+      const rows = await listFeedPostReactions(user, id, MAX_POST_REACTIONS)
+      return jsonResponse(rows.map(serializeFeedPostReaction))
     },
   )
 

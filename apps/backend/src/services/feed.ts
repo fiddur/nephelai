@@ -19,9 +19,9 @@
  */
 import type { FeedPost } from '@aurboda/api-spec'
 
-import type { Activity, FeedPostCursor, FeedPostRecord } from '../db/index.ts'
+import type { Activity, FeedPostCursor, FeedPostReactionCount, FeedPostRecord } from '../db/index.ts'
 
-import { getActivityById, listFeedPosts } from '../db/index.ts'
+import { countFeedPostReactions, getActivityById, listFeedPosts } from '../db/index.ts'
 import { resolveActivityScalars } from './activitypub/feed-activity.ts'
 import { feedPostContent, formatActivityWindow } from './activitypub/object.ts'
 import {
@@ -212,6 +212,33 @@ export type FeedPostsFetcher = (
   before?: FeedPostCursor,
 ) => Promise<FeedPostRecord[]>
 
+/** Batched like/boost tallies for a page of posts — the second DB dependency of `getFeedPage`. */
+export type FeedReactionCountsFetcher = (user: string, postIds: string[]) => Promise<FeedPostReactionCount[]>
+
+/**
+ * Attach `like_count` / `boost_count` to a page of serialised posts from ONE
+ * grouped count query. Best-effort: the counts are decoration, so a failed
+ * lookup leaves the page uncounted rather than failing the listing.
+ */
+const withReactionCounts = async (
+  user: string,
+  posts: FeedPost[],
+  fetchCounts: FeedReactionCountsFetcher,
+): Promise<FeedPost[]> => {
+  if (posts.length === 0) return posts
+  const rows = await fetchCounts(
+    user,
+    posts.map((post) => post.id),
+  ).catch(() => [])
+  const tally = new Map<string, number>()
+  for (const row of rows) tally.set(`${row.kind}:${row.post_id}`, row.count)
+  return posts.map((post) => ({
+    ...post,
+    boost_count: tally.get(`announce:${post.id}`) ?? 0,
+    like_count: tally.get(`like:${post.id}`) ?? 0,
+  }))
+}
+
 /**
  * One keyset page of the owner's feed (newest first) plus the cursor for the
  * next page — null when there are no more (#1012). Shared by the REST `GET
@@ -227,15 +254,19 @@ export const getFeedPage = async (
   cursor: string | undefined,
   opts: SerializeFeedPostOpts = {},
   fetchPosts: FeedPostsFetcher = listFeedPosts,
+  fetchReactionCounts: FeedReactionCountsFetcher = countFeedPostReactions,
 ): Promise<{ posts: FeedPost[]; next_cursor: string | null }> => {
   const decoded = decodeKeysetCursor(cursor)
   const rows = await fetchPosts(user, limit + 1, decoded && { created_at: decoded.ts, id: decoded.id })
   const hasMore = rows.length > limit
   const page = hasMore ? rows.slice(0, limit) : rows
   const last = page[page.length - 1]
+  const posts = await Promise.all(page.map((record) => serializeFeedPost(user, record, opts)))
   return {
     next_cursor: hasMore && last ? encodeKeysetCursor(last.created_at, last.id) : null,
-    posts: await Promise.all(page.map((record) => serializeFeedPost(user, record, opts))),
+    // Only the LISTING carries reaction counts (one batched query per page);
+    // single-post responses leave them absent.
+    posts: await withReactionCounts(user, posts, fetchReactionCounts),
   }
 }
 

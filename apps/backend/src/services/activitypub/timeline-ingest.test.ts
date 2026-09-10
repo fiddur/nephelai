@@ -65,6 +65,7 @@ describe('noteToTimelineInput', () => {
 
   test('maps a Note to a timeline input, sanitising content and using the cached author', () => {
     const note = new Note({
+      attribution: new URL(author.actor_uri),
       content: '<p>Hello <script>evil()</script></p>',
       id: new URL('https://mastodon.example/notes/1'),
       published: published('2026-07-02T08:30:00Z'),
@@ -83,6 +84,7 @@ describe('noteToTimelineInput', () => {
 
   test('falls back to the object id when the Note has no url', () => {
     const note = new Note({
+      attribution: new URL(author.actor_uri),
       content: '<p>x</p>',
       id: new URL('https://mastodon.example/notes/2'),
       published: published('2026-07-02T09:00:00Z'),
@@ -91,9 +93,17 @@ describe('noteToTimelineInput', () => {
   })
 
   test('returns null when the Note lacks an id or published time', () => {
-    const noId = new Note({ content: 'x', published: published('2026-07-02T09:00:00Z') })
+    const noId = new Note({
+      attribution: new URL(author.actor_uri),
+      content: 'x',
+      published: published('2026-07-02T09:00:00Z'),
+    })
     expect(noteToTimelineInput(noId, author)).toBeNull()
-    const noPublished = new Note({ content: 'x', id: new URL('https://mastodon.example/notes/3') })
+    const noPublished = new Note({
+      attribution: new URL(author.actor_uri),
+      content: 'x',
+      id: new URL('https://mastodon.example/notes/3'),
+    })
     expect(noteToTimelineInput(noPublished, author)).toBeNull()
   })
 
@@ -101,11 +111,24 @@ describe('noteToTimelineInput', () => {
     // An accepted followee delivering a Note with an id on ANOTHER actor's host
     // could otherwise overwrite that actor's entry via the global object_uri key.
     const spoof = new Note({
+      attribution: new URL(author.actor_uri),
       content: '<p>pwned</p>',
       id: new URL('https://good.example/notes/1'),
       published: published('2026-07-02T08:30:00Z'),
     })
     expect(noteToTimelineInput(spoof, author)).toBeNull()
+  })
+
+  test('rejects a Note that declares no attributedTo at all (#1018)', () => {
+    // A same-host Note with no attribution used to pass on host match alone,
+    // which let anyone on a followee's host claim an existing entry's object_uri
+    // and overwrite it through the upsert.
+    const unattributed = new Note({
+      content: '<p>whose is this?</p>',
+      id: new URL('https://mastodon.example/notes/8'),
+      published: published('2026-07-02T08:30:00Z'),
+    })
+    expect(noteToTimelineInput(unattributed, author)).toBeNull()
   })
 
   test('rejects a Note attributed to a different actor', () => {
@@ -131,6 +154,7 @@ describe('noteToTimelineInput', () => {
   test('clamps a far-future published_at to now (anti-pin), leaving past timestamps intact', () => {
     const now = new Date('2026-07-02T12:00:00Z').getTime()
     const future = new Note({
+      attribution: new URL(author.actor_uri),
       content: '<p>pinned</p>',
       id: new URL('https://mastodon.example/notes/11'),
       published: published('3000-01-01T00:00:00Z'),
@@ -139,6 +163,7 @@ describe('noteToTimelineInput', () => {
       '2026-07-02T12:00:00.000Z',
     )
     const past = new Note({
+      attribution: new URL(author.actor_uri),
       content: '<p>ok</p>',
       id: new URL('https://mastodon.example/notes/12'),
       published: published('2026-07-01T08:00:00Z'),
@@ -146,6 +171,59 @@ describe('noteToTimelineInput', () => {
     expect(noteToTimelineInput(past, author, now)?.published_at.toISOString()).toBe(
       '2026-07-01T08:00:00.000Z',
     )
+  })
+
+  describe('boost cards', () => {
+    const boosted = new Note({
+      attribution: new URL(author.actor_uri),
+      content: '<p>original post</p>',
+      id: new URL('https://mastodon.example/notes/20'),
+      published: published('2026-07-02T08:00:00Z'),
+      url: new URL('https://mastodon.example/@alice/20'),
+    })
+    const boost = {
+      actor_uri: 'https://remote.example/users/bob',
+      announce_uri: 'https://remote.example/users/bob/statuses/99/activity',
+      display_name: 'Bob',
+      handle: '@bob@remote.example',
+      published_at: new Date('2026-07-02T10:00:00Z'),
+    }
+
+    test('keys the row on the Announce id and keeps the original post in boost_of_uri', () => {
+      const input = noteToTimelineInput(boosted, author, Date.now(), boost)
+      // The Announce id is the upsert key, so two followees boosting one post
+      // give two cards and neither collides with the original's own entry.
+      expect(input?.object_uri).toBe('https://remote.example/users/bob/statuses/99/activity')
+      expect(input?.boost_of_uri).toBe('https://mastodon.example/notes/20')
+      // Author + content still describe the ORIGINAL post — that's what renders.
+      expect(input?.actor_uri).toBe(author.actor_uri)
+      expect(input?.content).toContain('original post')
+      expect(input?.url).toBe('https://mastodon.example/@alice/20')
+      expect(input?.boosted_by_actor_uri).toBe('https://remote.example/users/bob')
+      expect(input?.boosted_by_handle).toBe('@bob@remote.example')
+      expect(input?.boosted_by_display_name).toBe('Bob')
+    })
+
+    test('sorts at boost time, clamped to now like any other published_at', () => {
+      expect(noteToTimelineInput(boosted, author, Date.now(), boost)?.published_at.toISOString()).toBe(
+        '2026-07-02T10:00:00.000Z',
+      )
+      const future = { ...boost, published_at: new Date('3000-01-01T00:00:00Z') }
+      const now = new Date('2026-07-02T12:00:00Z').getTime()
+      expect(noteToTimelineInput(boosted, author, now, future)?.published_at.toISOString()).toBe(
+        '2026-07-02T12:00:00.000Z',
+      )
+    })
+
+    test('still applies the author host + attribution guards to the boosted Note', () => {
+      const elsewhere = new Note({
+        attribution: new URL(author.actor_uri),
+        content: '<p>spoof</p>',
+        id: new URL('https://other.example/notes/1'),
+        published: published('2026-07-02T08:00:00Z'),
+      })
+      expect(noteToTimelineInput(elsewhere, author, Date.now(), boost)).toBeNull()
+    })
   })
 })
 

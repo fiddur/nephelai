@@ -7,9 +7,11 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
 import { cleanTestDb, getTestUser, startTestDb, stopTestDb } from '../test/db-test-helper.ts'
 import { query } from './connection.ts'
 import {
+  deleteBoostEntry,
   deleteTimelineEntriesByActor,
   deleteTimelineEntryByUri,
   getTimelineEntryById,
+  getTimelineEntryByObjectUri,
   listReplyUncheckedEntries,
   listTimelineEntries,
   listUnenrichedAurbodaEntries,
@@ -328,5 +330,107 @@ describe('Timeline store integration', () => {
     expect((await listTimelineEntries(user, 10)).map((e) => e.actor_uri)).toEqual([
       'https://remote.example/users/bob',
     ])
+  })
+
+  describe('boost cards (an Announce by a followee of a third-party post)', () => {
+    const BOB = 'https://remote.example/users/bob'
+    const ANNOUNCE = 'https://remote.example/users/bob/statuses/9/activity'
+
+    /** A boost card: keyed on the Announce id, describing alice's post. */
+    const boostOfAlice = (overrides: Partial<TimelineEntryInput> = {}): TimelineEntryInput =>
+      entry(1, {
+        boost_of_uri: 'https://mastodon.example/notes/1',
+        boosted_by_actor_uri: BOB,
+        boosted_by_display_name: 'Bob',
+        boosted_by_handle: '@bob@remote.example',
+        object_uri: ANNOUNCE,
+        published_at: new Date('2026-07-01T12:00:00Z'),
+        ...overrides,
+      })
+
+    test('round-trips the boost columns and coexists with the original entry', async () => {
+      const user = getTestUser()
+      await upsertTimelineEntry(user, entry(1))
+      const boost = await upsertTimelineEntry(user, boostOfAlice())
+      expect(boost.inserted).toBe(true)
+      expect(boost.object_uri).toBe(ANNOUNCE)
+      expect(boost.boost_of_uri).toBe('https://mastodon.example/notes/1')
+      expect(boost.boosted_by_actor_uri).toBe(BOB)
+      expect(boost.boosted_by_handle).toBe('@bob@remote.example')
+      // The author columns still describe the ORIGINAL post — that's what renders.
+      expect(boost.actor_uri).toBe('https://mastodon.example/users/alice')
+      expect(await listTimelineEntries(user, 10)).toHaveLength(2)
+      expect((await getTimelineEntryByObjectUri(user, ANNOUNCE))?.id).toBe(boost.id)
+    })
+
+    test('two followees boosting the same post give two cards (keyed on the Announce)', async () => {
+      const user = getTestUser()
+      await upsertTimelineEntry(user, boostOfAlice())
+      await upsertTimelineEntry(
+        user,
+        boostOfAlice({
+          boosted_by_actor_uri: 'https://third.example/users/carol',
+          object_uri: 'https://third.example/users/carol/statuses/3/activity',
+        }),
+      )
+      expect(await listTimelineEntries(user, 10)).toHaveLength(2)
+    })
+
+    test('the author deleting their post retracts the boosts of it too', async () => {
+      const user = getTestUser()
+      await upsertTimelineEntry(user, entry(1))
+      await upsertTimelineEntry(user, boostOfAlice())
+      await upsertTimelineEntry(user, entry(2))
+
+      // Scoped to the ORIGINAL author (the boost row's actor_uri), so the same
+      // authorization guard covers both rows.
+      expect(
+        await deleteTimelineEntryByUri(
+          user,
+          'https://mastodon.example/notes/1',
+          'https://mastodon.example/users/alice',
+        ),
+      ).toBe(true)
+      expect((await listTimelineEntries(user, 10)).map((e) => e.object_uri)).toEqual([
+        'https://mastodon.example/notes/2',
+      ])
+    })
+
+    test('deleteBoostEntry removes one boost card, scoped to the booster', async () => {
+      const user = getTestUser()
+      await upsertTimelineEntry(user, entry(1))
+      await upsertTimelineEntry(user, boostOfAlice())
+
+      // Someone else's Undo{Announce} naming that id must not evict Bob's boost.
+      expect(await deleteBoostEntry(user, ANNOUNCE, 'https://evil.example/users/mallory')).toBe(false)
+      expect(await deleteBoostEntry(user, ANNOUNCE, BOB)).toBe(true)
+      // The original post itself is untouched.
+      expect((await listTimelineEntries(user, 10)).map((e) => e.object_uri)).toEqual([
+        'https://mastodon.example/notes/1',
+      ])
+    })
+
+    test('unfollowing drops the actor’s own posts and their boosts, but not others’ boosts of them', async () => {
+      const user = getTestUser()
+      const alice = 'https://mastodon.example/users/alice'
+      // alice's own post, bob's boost of alice's post, and alice's boost of
+      // somebody else's post.
+      await upsertTimelineEntry(user, entry(1))
+      await upsertTimelineEntry(user, boostOfAlice())
+      await upsertTimelineEntry(
+        user,
+        entry(2, {
+          actor_uri: 'https://third.example/users/carol',
+          boost_of_uri: 'https://third.example/notes/7',
+          boosted_by_actor_uri: alice,
+          object_uri: 'https://mastodon.example/users/alice/statuses/5/activity',
+        }),
+      )
+
+      expect(await deleteTimelineEntriesByActor(user, alice)).toBe(2)
+      // Bob's boost of alice's post survives — that's in the timeline because of
+      // the (still active) follow of Bob.
+      expect((await listTimelineEntries(user, 10)).map((e) => e.object_uri)).toEqual([ANNOUNCE])
+    })
   })
 })

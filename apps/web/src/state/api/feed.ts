@@ -2,6 +2,8 @@ import type {
   ArticleExportResponse,
   CreateArticleBody,
   FeedPost,
+  FeedPostReaction,
+  FeedPostReactionsResponse,
   FeedPostResponse,
   FeedPostsResponse,
   FollowActorResponse,
@@ -14,6 +16,8 @@ import type {
   ShareActivityBody,
   ShareChallengeBody,
   SharePreviewResponse,
+  TimelineEntry,
+  TimelineEntryResponse,
   TimelineRepliesResponse,
   TimelineResponse,
   UpdateArticleBody,
@@ -239,6 +243,55 @@ export const fetchTimelineReplies = async (entryId: string): Promise<TimelineRep
     { headers: authHeaders() },
   )
   return response.data
+}
+
+/**
+ * Toggle a like ⭐ or boost 🔄 on one home-timeline post and return the server's
+ * updated entry (the authoritative replacement for the caller's optimistic
+ * patch). All four are idempotent server-side.
+ */
+const toggleReaction = async (
+  entryId: string,
+  kind: 'boost' | 'like',
+  on: boolean,
+): Promise<TimelineEntry> => {
+  const url = `${API_URL}/feed/timeline/${encodeURIComponent(entryId)}/${kind}`
+  let response
+  try {
+    response = on
+      ? await axios.post<TimelineEntryResponse>(url, {}, { headers: authHeaders() })
+      : await axios.delete<TimelineEntryResponse>(url, { headers: authHeaders() })
+  } catch (error) {
+    // Surface the server's reason (e.g. "Couldn't reach the author's server").
+    throw new Error(apiErrorMessage(error, 'Couldn’t save that. Please try again.'))
+  }
+  if (!response.data.entry) throw new Error('No entry returned')
+  return response.data.entry
+}
+
+/** Favourite a home-timeline post (delivers an AS2 `Like` to its author). */
+export const likeTimelineEntry = (entryId: string): Promise<TimelineEntry> =>
+  toggleReaction(entryId, 'like', true)
+
+/** Remove your favourite (delivers an `Undo{Like}`). */
+export const unlikeTimelineEntry = (entryId: string): Promise<TimelineEntry> =>
+  toggleReaction(entryId, 'like', false)
+
+/** Boost a home-timeline post (delivers an AS2 `Announce` to your followers + its author). */
+export const boostTimelineEntry = (entryId: string): Promise<TimelineEntry> =>
+  toggleReaction(entryId, 'boost', true)
+
+/** Retract your boost (delivers an `Undo{Announce}`). */
+export const unboostTimelineEntry = (entryId: string): Promise<TimelineEntry> =>
+  toggleReaction(entryId, 'boost', false)
+
+/** Who favourited or boosted one of YOUR feed posts, newest first. */
+export const fetchFeedPostReactions = async (postId: string): Promise<FeedPostReaction[]> => {
+  const response = await axios.get<FeedPostReactionsResponse>(
+    `${API_URL}/feed/${encodeURIComponent(postId)}/reactions`,
+    { headers: authHeaders() },
+  )
+  return response.data.reactions
 }
 
 /**

@@ -7,6 +7,10 @@ import { getTimelinePage, serializeTimelineEntry } from './timeline.ts'
 const record = (over: Partial<TimelineEntryRecord> = {}): TimelineEntryRecord => ({
   actor_uri: 'https://remote.example/users/alice',
   avatar_url: 'https://remote.example/avatars/alice.png',
+  boost_of_uri: null,
+  boosted_by_actor_uri: null,
+  boosted_by_display_name: null,
+  boosted_by_handle: null,
   content: '<p>Ran a 5k</p>',
   display_name: 'Alice',
   handle: '@alice@remote.example',
@@ -53,6 +57,41 @@ describe('serializeTimelineEntry', () => {
     )
     expect(other.in_reply_to_mine).toBe(false)
   })
+
+  test('marks liked/boosted only when the reader actually reacted', () => {
+    const plain = serializeTimelineEntry(record(), undefined, new Set())
+    // Absent, not `false` — same convention as `mentions_me`.
+    expect(plain).not.toHaveProperty('liked')
+    expect(plain).not.toHaveProperty('boosted')
+
+    const reacted = serializeTimelineEntry(
+      record(),
+      undefined,
+      new Set(['like:https://remote.example/notes/1']),
+    )
+    expect(reacted.liked).toBe(true)
+    expect(reacted).not.toHaveProperty('boosted')
+  })
+
+  test('a boost card exposes boost_of_uri + boosted_by, and reacts on the ORIGINAL post', () => {
+    const boost = record({
+      boost_of_uri: 'https://remote.example/notes/1',
+      boosted_by_actor_uri: 'https://elsewhere.example/users/bob',
+      boosted_by_display_name: 'Bob',
+      boosted_by_handle: '@bob@elsewhere.example',
+      object_uri: 'https://elsewhere.example/users/bob/statuses/9/activity',
+    })
+    // Liking a boost likes the post it shows (its own object_uri is the
+    // Announce id, which nobody can like) — exactly as on Mastodon.
+    const dto = serializeTimelineEntry(boost, undefined, new Set(['like:https://remote.example/notes/1']))
+    expect(dto.boost_of_uri).toBe('https://remote.example/notes/1')
+    expect(dto.boosted_by).toEqual({
+      actor_uri: 'https://elsewhere.example/users/bob',
+      display_name: 'Bob',
+      handle: '@bob@elsewhere.example',
+    })
+    expect(dto.liked).toBe(true)
+  })
 })
 
 describe('getTimelinePage', () => {
@@ -65,6 +104,41 @@ describe('getTimelinePage', () => {
       }),
     )
 
+  test('batch-loads the reader’s reactions once per page, keyed on the reacted-to object', async () => {
+    const calls: string[][] = []
+    const page = await getTimelinePage('user', 20, undefined, {
+      fetchEntries: async () => [
+        record({ object_uri: 'https://remote.example/notes/1' }),
+        record({
+          boost_of_uri: 'https://remote.example/notes/2',
+          boosted_by_actor_uri: 'https://elsewhere.example/users/bob',
+          id: '00000000-0000-0000-0000-000000000002',
+          object_uri: 'https://elsewhere.example/users/bob/statuses/9/activity',
+        }),
+      ],
+      fetchReactions: async (_u, uris) => {
+        calls.push(uris)
+        return [{ kind: 'announce', object_uri: 'https://remote.example/notes/2' }]
+      },
+    })
+    // ONE query for the whole page, and the boost card is looked up by the
+    // original Note's id, not its Announce id.
+    expect(calls).toEqual([['https://remote.example/notes/1', 'https://remote.example/notes/2']])
+    expect(page.entries[0]).not.toHaveProperty('boosted')
+    expect(page.entries[1].boosted).toBe(true)
+  })
+
+  test('a failed reaction lookup leaves the page unmarked rather than failing the read', async () => {
+    const page = await getTimelinePage('user', 20, undefined, {
+      fetchEntries: async () => rows(1),
+      fetchReactions: async () => {
+        throw new Error('db down')
+      },
+    })
+    expect(page.entries).toHaveLength(1)
+    expect(page.entries[0]).not.toHaveProperty('liked')
+  })
+
   test('requests limit + 1 rows and passes a decoded cursor of undefined on the first page', async () => {
     const calls: { limit: number; cursor?: TimelineCursor }[] = []
     await getTimelinePage('user', 20, undefined, {
@@ -72,6 +146,7 @@ describe('getTimelinePage', () => {
         calls.push({ cursor, limit })
         return []
       },
+      fetchReactions: async () => [],
     })
     expect(calls).toEqual([{ cursor: undefined, limit: 21 }])
   })
@@ -83,6 +158,7 @@ describe('getTimelinePage', () => {
         seen = replies
         return []
       },
+      fetchReactions: async () => [],
       loadSettings: async () => ({ timeline_show_replies: false }),
       origin: 'https://aurboda.example/',
     })
@@ -93,19 +169,28 @@ describe('getTimelinePage', () => {
   })
 
   test('returns no next_cursor when the fetch yields at most `limit` rows', async () => {
-    const page = await getTimelinePage('user', 20, undefined, { fetchEntries: async () => rows(20) })
+    const page = await getTimelinePage('user', 20, undefined, {
+      fetchEntries: async () => rows(20),
+      fetchReactions: async () => [],
+    })
     expect(page.entries).toHaveLength(20)
     expect(page.next_cursor).toBeNull()
   })
 
   test('trims the sentinel row and emits a next_cursor when there are more', async () => {
-    const page = await getTimelinePage('user', 20, undefined, { fetchEntries: async () => rows(21) })
+    const page = await getTimelinePage('user', 20, undefined, {
+      fetchEntries: async () => rows(21),
+      fetchReactions: async () => [],
+    })
     expect(page.entries).toHaveLength(20)
     expect(page.next_cursor).toEqual(expect.any(String))
   })
 
   test('a next_cursor round-trips back to the (published_at, id) of the last returned row', async () => {
-    const first = await getTimelinePage('user', 2, undefined, { fetchEntries: async () => rows(3) })
+    const first = await getTimelinePage('user', 2, undefined, {
+      fetchEntries: async () => rows(3),
+      fetchReactions: async () => [],
+    })
     const lastEntry = first.entries[first.entries.length - 1]
 
     let received: TimelineCursor | undefined
@@ -114,6 +199,7 @@ describe('getTimelinePage', () => {
         received = cursor
         return []
       },
+      fetchReactions: async () => [],
     })
     expect(received?.id).toBe(lastEntry.id)
     expect(received?.published_at.toISOString()).toBe(lastEntry.published_at)
@@ -126,6 +212,7 @@ describe('getTimelinePage', () => {
         received = cursor
         return []
       },
+      fetchReactions: async () => [],
     })
     expect(received).toBeUndefined()
   })
@@ -140,6 +227,7 @@ describe('getTimelinePage', () => {
         received = cursor
         return []
       },
+      fetchReactions: async () => [],
     })
     expect(received).toBeUndefined()
   })

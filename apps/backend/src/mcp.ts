@@ -21,6 +21,7 @@ import type { CentralDb } from './services/central-db.ts'
 import type { DiscoverChallenges } from './services/challenge-discovery.ts'
 import type { DeductionEngineDeps } from './services/deduction-engine.ts'
 import type { ActivityNotifier, DeductionQueue } from './services/deduction-queue.ts'
+import type { ReactionActions } from './services/feed-reactions.ts'
 import type { FollowerActions } from './services/followers.ts'
 import type { FollowActions } from './services/following.ts'
 import type { SyncProvider } from './services/queries/index.ts'
@@ -73,6 +74,7 @@ interface McpDeps {
   gravl?: GravlClient
   onActivityMutated?: ActivityNotifier
   oura?: OuraClientType
+  reactionActions?: ReactionActions
   retroEnrichTimeline?: RetroEnrichTrigger
   stravaQueue?: StravaQueue
   sync?: SyncProvider
@@ -123,6 +125,7 @@ const createMcpServer = (user: string, deps: McpDeps = {}): McpServer => {
     deliver: deps.feedDeliver,
     followActions: deps.followActions,
     followerActions: deps.followerActions,
+    reactionActions: deps.reactionActions,
     retroEnrichTimeline: deps.retroEnrichTimeline,
     webHost: deps.webHost,
   })

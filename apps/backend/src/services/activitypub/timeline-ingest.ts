@@ -75,13 +75,36 @@ export const sanitizeRemoteHtml = (html: string): string =>
  * **Authority check.** `note.id` becomes `object_uri`, the *globally-unique* upsert
  * key. Without an origin check a malicious accepted followee could deliver a Note
  * whose id collides with another followee's post and overwrite it (attributed to
- * themselves). So we require the Note to originate from the sender's host and, when
- * it declares `attributedTo`, to attribute to the sender — the symmetric guard to
- * the sender-scoped inbound `Delete`. The author's presentation (handle / name /
- * avatar) comes from the cached `feed_following` row (no extra network).
+ * themselves). So we require the Note to originate from the sender's host and to
+ * **declare `attributedTo` naming the sender** — the symmetric guard to the
+ * sender-scoped inbound `Delete`. A Note with no `attributedTo` at all used to
+ * pass on host match alone; every real implementation sets it, so requiring it
+ * costs nothing and closes the same-host claim (#1018). The author's presentation
+ * (handle / name / avatar) comes from the cached `feed_following` row (no extra
+ * network).
  */
 /** The author fields the timeline snapshot needs — a followee row, or a stranger-replier's fetched presentation. */
 export type TimelineAuthor = Pick<FeedFollowingRecord, 'actor_uri' | 'avatar_url' | 'display_name' | 'handle'>
+
+/**
+ * The boost wrapper around a Note: an `Announce` by a followee of a THIRD-PARTY
+ * post. It replaces the row's identity — `object_uri` becomes the Announce id
+ * (globally unique, so two followees boosting one post give two cards and a
+ * boost never collides with the original's own entry), the announced Note's id
+ * moves to `boost_of_uri`, and `published_at` becomes the boost time so the card
+ * sorts where Mastodon puts it. Everything else still describes the ORIGINAL
+ * post and author, so the card renders that post.
+ */
+export interface TimelineBoostSource {
+  /** The `Announce` activity's id — the boost card's `object_uri`. */
+  announce_uri: string
+  /** The followee who boosted. */
+  actor_uri: string
+  handle: string | null
+  display_name: string | null
+  /** The `Announce`'s `published` (or now, when it declares none). */
+  published_at: Date
+}
 
 /** Whether the Note carries a `Mention` tag pointing at `actorUri` (#1060). */
 export const noteMentionsActor = async (note: Note, actorUri: string): Promise<boolean> => {
@@ -95,28 +118,38 @@ export const noteToTimelineInput = (
   note: Note,
   author: TimelineAuthor,
   now: number = Date.now(),
+  /** When set, the entry becomes a BOOST card of this Note (see `TimelineBoostSource`). */
+  boost?: TimelineBoostSource,
 ): TimelineEntryInput | null => {
   if (note.id == null || note.published == null) return null
-  // The sender (this Note's author) is `author.actor_uri` — the accepted followee
-  // the inbox handler looked up by the activity's actor id.
+  // The Note's author is `author.actor_uri` — for a direct delivery the accepted
+  // followee the inbox handler looked up by the activity's actor id; for a boost
+  // the announced Note's own (separately resolved) author.
   const senderHost = new URL(author.actor_uri).host
   if (note.id.host !== senderHost) return null
-  const attributions = note.attributionIds
-  if (attributions.length > 0 && !attributions.some((uri) => uri.href === author.actor_uri)) return null
+  if (!note.attributionIds.some((uri) => uri.href === author.actor_uri)) return null
   // Clamp `published_at` to "not in the future": it's the timeline sort key, so a
   // far-future timestamp would otherwise let a followed actor pin a post to the top
   // indefinitely (and re-pin via Update). Same guard Mastodon applies on ingest.
-  const publishedAt = temporalInstantToDate(note.published)
+  const publishedAt = boost ? boost.published_at : temporalInstantToDate(note.published)
   return {
     actor_uri: author.actor_uri,
     avatar_url: author.avatar_url,
+    ...(boost == null
+      ? {}
+      : {
+          boost_of_uri: note.id.href,
+          boosted_by_actor_uri: boost.actor_uri,
+          boosted_by_display_name: boost.display_name,
+          boosted_by_handle: boost.handle,
+        }),
     content: sanitizeRemoteHtml(note.content?.toString() ?? ''),
     display_name: author.display_name,
     handle: author.handle,
     // A reply's target id, so the timeline can filter replies-to-others and
     // notify only replies the reader is involved in (#1060).
     in_reply_to_uri: note.replyTargetIds[0]?.href ?? null,
-    object_uri: note.id.href,
+    object_uri: boost ? boost.announce_uri : note.id.href,
     published_at: new Date(Math.min(publishedAt.getTime(), now)),
     url: note.url instanceof URL ? note.url.href : note.id.href,
   }

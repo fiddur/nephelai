@@ -15,6 +15,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from 'vit
  */
 import { insertActivity } from '../db/activities/index.ts'
 import { createChallenge, createChallengeParticipation } from '../db/challenges.ts'
+import { upsertFeedPostReaction } from '../db/feed-reactions.ts'
 import { createFeedPost } from '../db/feed.ts'
 import { insertTimeSeries } from '../db/time-series.ts'
 import { cleanTestDb, getTestUser, startTestDb, stopTestDb } from '../test/db-test-helper.ts'
@@ -420,5 +421,90 @@ describe('POST /feed/challenges (share a challenge — #994)', () => {
     expect(deliver.updatedChallenge).toHaveBeenCalledTimes(1)
     expect(deliver.updated).not.toHaveBeenCalled()
     expect(deliver.updatedArticle).not.toHaveBeenCalled()
+  })
+})
+
+describe('Feed post reactions (integration)', () => {
+  let app: ReturnType<typeof startApp>
+
+  const post = () =>
+    createFeedPost(getTestUser(), {
+      activity_id: null,
+      include_chart: false,
+      include_map: false,
+      included_metrics: [],
+      series_metrics: [],
+      visibility: 'public',
+    })
+
+  beforeAll(async () => {
+    await startTestDb()
+    app = startApp()
+  }, CONTAINER_TIMEOUT)
+
+  afterAll(async () => {
+    await app.close()
+    await stopTestDb()
+  })
+
+  beforeEach(async () => {
+    await cleanTestDb()
+  })
+
+  test('GET /feed/:postId/reactions lists who liked and boosted, newest first', async () => {
+    const user = getTestUser()
+    const created = await post()
+    await upsertFeedPostReaction(user, {
+      actor_uri: 'https://mastodon.example/users/alice',
+      display_name: 'Alice',
+      handle: '@alice@mastodon.example',
+      kind: 'like',
+      post_id: created.id,
+    })
+    await upsertFeedPostReaction(user, {
+      actor_uri: 'https://remote.example/users/bob',
+      handle: '@bob@remote.example',
+      kind: 'announce',
+      post_id: created.id,
+    })
+
+    const res = await app.request.get(`/feed/${created.id}/reactions`)
+    expect(res.status).toBe(200)
+    expect(res.body.success).toBe(true)
+    expect(res.body.reactions).toHaveLength(2)
+    expect(res.body.reactions.map((r: { kind: string }) => r.kind).sort()).toEqual(['announce', 'like'])
+    // Internal bookkeeping never reaches the wire.
+    expect(res.body.reactions[0]).not.toHaveProperty('post_id')
+  })
+
+  test('GET /feed/:postId/reactions 404s an unknown or non-UUID post id', async () => {
+    expect((await app.request.get('/feed/00000000-0000-0000-0000-000000000000/reactions')).status).toBe(404)
+    expect((await app.request.get('/feed/not-a-uuid/reactions')).status).toBe(404)
+  })
+
+  test('GET /feed attaches like_count / boost_count to the listing', async () => {
+    const user = getTestUser()
+    const counted = await post()
+    const uncounted = await post()
+    await upsertFeedPostReaction(user, {
+      actor_uri: 'https://mastodon.example/users/alice',
+      kind: 'like',
+      post_id: counted.id,
+    })
+    await upsertFeedPostReaction(user, {
+      actor_uri: 'https://remote.example/users/bob',
+      kind: 'like',
+      post_id: counted.id,
+    })
+
+    const res = await app.request.get('/feed')
+    const byId = Object.fromEntries(
+      res.body.posts.map((p: { id: string; like_count: number; boost_count: number }) => [
+        p.id,
+        { boost: p.boost_count, like: p.like_count },
+      ]),
+    )
+    expect(byId[counted.id]).toEqual({ boost: 0, like: 2 })
+    expect(byId[uncounted.id]).toEqual({ boost: 0, like: 0 })
   })
 })
