@@ -18,6 +18,7 @@ import { createChallenge, createChallengeParticipation } from '../db/challenges.
 import { upsertFeedPostReaction } from '../db/feed-reactions.ts'
 import { createFeedPost } from '../db/feed.ts'
 import { insertTimeSeries } from '../db/time-series.ts'
+import { upsertTimelineEntry } from '../db/timeline.ts'
 import { cleanTestDb, getTestUser, startTestDb, stopTestDb } from '../test/db-test-helper.ts'
 import { type FeedDeliver, createFeedRouter } from './feed-router.ts'
 
@@ -140,8 +141,10 @@ describe('Article feed routes (integration)', () => {
     const deliver: FeedDeliver = {
       created: vi.fn(),
       createdArticle: vi.fn(),
+      createdReply: vi.fn(),
       deleted: vi.fn(),
       updated: vi.fn(),
+      updatedReply: vi.fn(),
       createdChallenge: vi.fn(),
       updatedArticle: vi.fn(),
       updatedChallenge: vi.fn(),
@@ -307,10 +310,12 @@ describe('POST /feed/challenges (share a challenge — #994)', () => {
       created: vi.fn(),
       createdArticle: vi.fn(),
       createdChallenge: vi.fn(),
+      createdReply: vi.fn(),
       deleted: vi.fn(),
       updated: vi.fn(),
       updatedArticle: vi.fn(),
       updatedChallenge: vi.fn(),
+      updatedReply: vi.fn(),
     }
     app = startApp(deliver, undefined, 'https://aurboda.example')
   }, CONTAINER_TIMEOUT)
@@ -506,5 +511,94 @@ describe('Feed post reactions (integration)', () => {
     )
     expect(byId[counted.id]).toEqual({ boost: 0, like: 2 })
     expect(byId[uncounted.id]).toEqual({ boost: 0, like: 0 })
+  })
+})
+
+describe('Own-post comments (GET /feed/:postId/replies + reply_count)', () => {
+  const WEB_HOST = 'https://aurboda.example'
+  let app: ReturnType<typeof startApp>
+
+  beforeAll(async () => {
+    await startTestDb()
+    app = startApp(undefined, undefined, WEB_HOST)
+  }, CONTAINER_TIMEOUT)
+
+  afterAll(async () => {
+    await app.close()
+    await stopTestDb()
+  })
+
+  beforeEach(async () => {
+    await cleanTestDb()
+  })
+
+  const ownPost = async () => {
+    const user = getTestUser()
+    const post = await createFeedPost(user, {
+      activity_id: null,
+      include_chart: false,
+      include_map: false,
+      included_metrics: [],
+      series_metrics: [],
+      visibility: 'public',
+    })
+    return { objectUri: `${WEB_HOST}/users/${user}/feed/${post.id}`, post, user }
+  }
+
+  const comment = (objectUri: string, n: number) =>
+    upsertTimelineEntry(getTestUser(), {
+      actor_uri: 'https://mastodon.example/users/alice',
+      content: `<p>comment ${n}</p>`,
+      display_name: 'Alice',
+      handle: '@alice@mastodon.example',
+      in_reply_to_uri: objectUri,
+      object_uri: `https://mastodon.example/notes/c${n}`,
+      published_at: new Date(`2026-07-0${n}T10:00:00Z`),
+    })
+
+  test('lists the received comments oldest-first as full timeline entries', async () => {
+    const { objectUri, post } = await ownPost()
+    await comment(objectUri, 2)
+    await comment(objectUri, 1)
+    // A reply to somebody ELSE's post must never appear here.
+    await comment('https://mastodon.example/notes/other', 3)
+
+    const res = await app.request.get(`/feed/${post.id}/replies`)
+    expect(res.status).toBe(200)
+    expect(res.body.success).toBe(true)
+    expect(res.body.replies.map((r: { content: string }) => r.content)).toEqual([
+      '<p>comment 1</p>',
+      '<p>comment 2</p>',
+    ])
+    // Full entries: repliable by their own local id, and marked as replies to us.
+    expect(res.body.replies[0].id).toEqual(expect.any(String))
+    expect(res.body.replies[0].in_reply_to_mine).toBe(true)
+  })
+
+  test('is an empty list for a post nobody commented on', async () => {
+    const { post } = await ownPost()
+    const res = await app.request.get(`/feed/${post.id}/replies`)
+    expect(res.status).toBe(200)
+    expect(res.body.replies).toEqual([])
+  })
+
+  test('404s an unknown or non-UUID post id', async () => {
+    expect((await app.request.get('/feed/not-a-uuid/replies')).status).toBe(404)
+    expect((await app.request.get('/feed/00000000-0000-4000-8000-000000000000/replies')).status).toBe(404)
+  })
+
+  test('GET /feed attaches reply_count per post', async () => {
+    const first = await ownPost()
+    const second = await ownPost()
+    await comment(first.objectUri, 1)
+    await comment(first.objectUri, 2)
+
+    const res = await app.request.get('/feed')
+    expect(res.status).toBe(200)
+    const counts = new Map(
+      res.body.posts.map((p: { id: string; reply_count: number }) => [p.id, p.reply_count]),
+    )
+    expect(counts.get(first.post.id)).toBe(2)
+    expect(counts.get(second.post.id)).toBe(0)
   })
 })

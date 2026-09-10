@@ -8,8 +8,11 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
  * per-user database, with a fake Fedify federation capturing what would be
  * delivered (the activity SHAPES are unit-tested in `feed-reactions.test.ts`).
  */
+import type { FeedDeliver } from '../routes/feed-router.ts'
+
 import { upsertFeedFollowing } from '../db/feed-following.ts'
 import { getFeedReaction } from '../db/feed-reactions.ts'
+import { listReplyPostsTo } from '../db/feed.ts'
 import { type TimelineEntryInput, upsertTimelineEntry } from '../db/timeline.ts'
 import { cleanTestDb, getTestUser, startTestDb, stopTestDb } from '../test/db-test-helper.ts'
 import { createReactionActions } from './feed-reactions.ts'
@@ -194,5 +197,142 @@ describe('Outbound reactions (integration)', () => {
       `${ALICE}/inbox`,
     )
     expect(sent).toHaveLength(1)
+  })
+})
+
+describe('Outbound replies 🗨 (integration)', () => {
+  beforeAll(async () => {
+    await startTestDb()
+  }, CONTAINER_TIMEOUT)
+
+  afterAll(async () => {
+    await stopTestDb()
+  })
+
+  beforeEach(async () => {
+    await cleanTestDb()
+  })
+
+  /** A FeedDeliver whose reply hooks just record the posts handed to them. */
+  const fakeDeliver = () => {
+    const created: string[] = []
+    const noop = () => {}
+    const deliver: FeedDeliver = {
+      created: noop,
+      createdArticle: noop,
+      createdChallenge: noop,
+      createdReply: (_user, post) => created.push(post.id),
+      deleted: noop,
+      updated: noop,
+      updatedArticle: noop,
+      updatedChallenge: noop,
+      updatedReply: noop,
+    }
+    return { created, deliver }
+  }
+
+  test('stores a reply post carrying the card’s target and hands it to delivery', async () => {
+    const user = getTestUser()
+    await followAlice(user)
+    const record = await upsertTimelineEntry(user, entry())
+    const { federation } = fakeFederation()
+    const { created, deliver } = fakeDeliver()
+
+    const result = await createReactionActions({ federation, origin: ORIGIN }, deliver).reply(
+      user,
+      record.id,
+      { message: '  Nice run!  ', visibility: 'unlisted' },
+    )
+    expect(result.ok).toBe(true)
+    const posts = await listReplyPostsTo(user, 'https://mastodon.example/notes/1')
+    expect(posts).toHaveLength(1)
+    expect(posts[0].kind).toBe('reply')
+    // Stored trimmed, targeted at the card's author — never at anything the
+    // request supplied.
+    expect(posts[0].message).toBe('Nice run!')
+    expect(posts[0].in_reply_to_actor_uri).toBe(ALICE)
+    expect(posts[0].in_reply_to_handle).toBe('@alice@mastodon.example')
+    expect(posts[0].visibility).toBe('unlisted')
+    expect(created).toEqual([posts[0].id])
+  })
+
+  test('replying to a BOOST card answers the ORIGINAL post', async () => {
+    const user = getTestUser()
+    await followAlice(user)
+    const record = await upsertTimelineEntry(
+      user,
+      entry({
+        boost_of_uri: 'https://mastodon.example/notes/1',
+        boosted_by_actor_uri: 'https://elsewhere.example/users/bob',
+        object_uri: 'https://elsewhere.example/users/bob/statuses/9/activity',
+      }),
+    )
+    const { federation } = fakeFederation()
+
+    const result = await createReactionActions({ federation, origin: ORIGIN }).reply(user, record.id, {
+      message: 'hi',
+      visibility: 'unlisted',
+    })
+    expect(result.ok).toBe(true)
+    expect(await listReplyPostsTo(user, 'https://mastodon.example/notes/1')).toHaveLength(1)
+    expect(
+      await listReplyPostsTo(user, 'https://elsewhere.example/users/bob/statuses/9/activity'),
+    ).toHaveLength(0)
+  })
+
+  test('derives the mention handle from the actor URI when the card never had one', async () => {
+    const user = getTestUser()
+    await followAlice(user)
+    const record = await upsertTimelineEntry(user, entry({ handle: null }))
+    const { federation } = fakeFederation()
+
+    await createReactionActions({ federation, origin: ORIGIN }).reply(user, record.id, {
+      message: 'hi',
+      visibility: 'unlisted',
+    })
+    const posts = await listReplyPostsTo(user, 'https://mastodon.example/notes/1')
+    expect(posts[0].in_reply_to_handle).toBe('@alice@mastodon.example')
+  })
+
+  test('404s an unknown entry and stores nothing', async () => {
+    const user = getTestUser()
+    const { federation } = fakeFederation()
+    const result = await createReactionActions({ federation, origin: ORIGIN }).reply(
+      user,
+      '00000000-0000-0000-0000-000000000000',
+      { message: 'hi', visibility: 'unlisted' },
+    )
+    expect(result).toMatchObject({ ok: false, status: 404 })
+  })
+
+  test('400s a blank reply before any lookup or write', async () => {
+    const user = getTestUser()
+    await followAlice(user)
+    const record = await upsertTimelineEntry(user, entry())
+    const { federation } = fakeFederation()
+
+    const result = await createReactionActions({ federation, origin: ORIGIN }).reply(user, record.id, {
+      message: '   ',
+      visibility: 'unlisted',
+    })
+    expect(result).toMatchObject({ ok: false, status: 400 })
+    expect(await listReplyPostsTo(user, 'https://mastodon.example/notes/1')).toEqual([])
+  })
+
+  test('502s when the answered author’s inbox can’t be resolved, leaving no post behind', async () => {
+    const user = getTestUser()
+    // No feed_following row → the author must be looked up, and that fails here.
+    const record = await upsertTimelineEntry(user, entry())
+    const { federation } = fakeFederation(async () => null)
+    const { created, deliver } = fakeDeliver()
+
+    const result = await createReactionActions({ federation, origin: ORIGIN }, deliver).reply(
+      user,
+      record.id,
+      { message: 'hi', visibility: 'unlisted' },
+    )
+    expect(result).toMatchObject({ ok: false, status: 502 })
+    expect(await listReplyPostsTo(user, 'https://mastodon.example/notes/1')).toEqual([])
+    expect(created).toEqual([])
   })
 })

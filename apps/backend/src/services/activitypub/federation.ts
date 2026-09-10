@@ -85,8 +85,11 @@ import {
   buildChallengeNoteCreate,
   buildFeedCreate,
   buildFeedNote,
+  buildReplyNote,
+  buildReplyNoteCreate,
   toDeliverableArticle,
   toDeliverableChallenge,
+  toDeliverableReply,
 } from './deliver.ts'
 import { toCryptoKeyPair } from './keys.ts'
 import { AS_PUBLIC, isPubliclyVisible } from './object.ts'
@@ -838,6 +841,8 @@ export const createFeedFederation = (
       if (article != null) return buildArticleNote(ctx, identifier, article, apiBaseUrl)
       const challenge = toDeliverableChallenge(post)
       if (challenge != null) return buildChallengeNote(ctx, identifier, challenge)
+      const reply = toDeliverableReply(post)
+      if (reply != null) return buildReplyNote(ctx, identifier, reply)
       if (post.activity_id == null) return null
       // Resolve the merged-span activity so the served Note matches what the user
       // shared (and what we delivered), not just the anchor sub-activity (#881).
@@ -878,6 +883,8 @@ export const createFeedFederation = (
             if (article != null) return buildArticleNoteCreate(ctx, identifier, article, apiBaseUrl)
             const challenge = toDeliverableChallenge(post)
             if (challenge != null) return buildChallengeNoteCreate(ctx, identifier, challenge)
+            const reply = toDeliverableReply(post)
+            if (reply != null) return buildReplyNoteCreate(ctx, identifier, reply)
             if (post.activity_id == null) return null
             const activity = await resolveFeedActivity(identifier, post.activity_id)
             return activity == null ? null : buildFeedCreate(ctx, identifier, post, activity, apiBaseUrl)

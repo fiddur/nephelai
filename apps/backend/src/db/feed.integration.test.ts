@@ -12,6 +12,7 @@ import {
   createArticlePost,
   createChallengePost,
   createFeedPost,
+  createReplyPost,
   deleteFeedPost,
   type FeedPostInput,
   findCoveringSharedSeriesWindow,
@@ -20,6 +21,8 @@ import {
   listFeedPosts,
   listPublicFeedPosts,
   listPublicFeedPostsPage,
+  listReplyPostsTo,
+  type ReplyPostInput,
   updateFeedPost,
 } from './feed.ts'
 
@@ -392,6 +395,78 @@ describe('Feed posts integration', () => {
       expect((await listFeedPosts(user, 10)).map((p) => p.id)).toContain(post.id)
       // Public/unlisted challenge shares appear on the outbox listing like any post.
       expect((await listPublicFeedPosts(user)).map((p) => p.id)).toContain(post.id)
+    })
+  })
+  describe('reply posts', () => {
+    const TARGET = 'https://mastodon.example/users/alice/statuses/9'
+    const TARGET_ACTOR = 'https://mastodon.example/users/alice'
+    const replyInput = (over: Partial<ReplyPostInput> = {}): ReplyPostInput => ({
+      in_reply_to_actor_uri: TARGET_ACTOR,
+      in_reply_to_handle: '@alice@mastodon.example',
+      in_reply_to_uri: TARGET,
+      message: 'Nice run!',
+      visibility: 'unlisted',
+      ...over,
+    })
+
+    test('creates a reply and round-trips its target by id', async () => {
+      const user = getTestUser()
+      const post = await createReplyPost(user, replyInput())
+
+      expect(post.kind).toBe('reply')
+      expect(post.in_reply_to_uri).toBe(TARGET)
+      expect(post.in_reply_to_actor_uri).toBe(TARGET_ACTOR)
+      expect(post.in_reply_to_handle).toBe('@alice@mastodon.example')
+      expect(post.message).toBe('Nice run!')
+      expect(post.activity_id).toBeNull()
+      expect(post.article).toBeNull()
+      expect(post.challenge).toBeNull()
+
+      const fetched = await getFeedPostById(user, post.id)
+      expect(fetched?.in_reply_to_uri).toBe(TARGET)
+      expect((await listFeedPosts(user, 10)).map((p) => p.id)).toContain(post.id)
+    })
+
+    test('stores a null handle when none was snapshotted', async () => {
+      const user = getTestUser()
+      const post = await createReplyPost(user, replyInput({ in_reply_to_handle: null }))
+      expect(post.in_reply_to_handle).toBeNull()
+    })
+
+    test('listReplyPostsTo returns only this target’s replies, oldest first', async () => {
+      const user = getTestUser()
+      const first = await createReplyPost(user, replyInput({ message: 'one' }))
+      const second = await createReplyPost(user, replyInput({ message: 'two' }))
+      await createReplyPost(user, replyInput({ in_reply_to_uri: `${TARGET}9`, message: 'elsewhere' }))
+      // A non-reply post pointing nowhere must never be picked up.
+      await createFeedPost(user, postInput())
+
+      const replies = await listReplyPostsTo(user, TARGET)
+      expect(replies.map((p) => p.id)).toEqual([first.id, second.id])
+    })
+
+    test('listReplyPostsTo is empty for a target with no replies', async () => {
+      const user = getTestUser()
+      expect(await listReplyPostsTo(user, TARGET)).toEqual([])
+    })
+
+    test('the outbox lists replies; the profile listing (includeReplies false) hides them', async () => {
+      const user = getTestUser()
+      const share = await createFeedPost(user, postInput({ visibility: 'public' }))
+      const reply = await createReplyPost(user, replyInput())
+
+      expect((await listPublicFeedPostsPage(user, 10, 0)).map((p) => p.id)).toEqual([reply.id, share.id])
+      expect(
+        (await listPublicFeedPostsPage(user, 10, 0, { includeReplies: false })).map((p) => p.id),
+      ).toEqual([share.id])
+      // The count is unchanged — the outbox counter still covers every post.
+      expect(await countPublicFeedPosts(user)).toBe(2)
+    })
+
+    test('a followers-only reply never reaches the outbox listing', async () => {
+      const user = getTestUser()
+      await createReplyPost(user, replyInput({ visibility: 'followers' }))
+      expect(await listPublicFeedPosts(user)).toEqual([])
     })
   })
 })

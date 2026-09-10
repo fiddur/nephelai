@@ -466,3 +466,75 @@
     border-color: #374151;
   }
 }
+
+/* The "you" badge on one of your own replies inside a thread snapshot. */
+.feed-post-reply-mine {
+  margin-left: 0.35rem;
+  padding: 0.05rem 0.35rem;
+  border: 1px solid #d1d5db;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+/* Inline reply composer, opened by the 🗨 action. */
+.feed-reply-composer {
+  margin-top: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.feed-reply-text {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.5rem;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 0.9rem;
+  resize: vertical;
+}
+
+.feed-reply-composer-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+/* Comments under one of your OWN posts: each is a full timeline entry card. */
+.feed-post-comments {
+  flex-basis: 100%;
+  order: 99;
+  margin-top: 0.5rem;
+  border-left: 2px solid #e5e7eb;
+  padding-left: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.feed-post-comment .feed-post-head {
+  margin-bottom: 0.25rem;
+}
+
+.feed-post-comment .feed-post-avatar {
+  width: 28px;
+  height: 28px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .feed-post-comments {
+    border-left-color: #374151;
+  }
+
+  .feed-post-reply-mine {
+    border-color: #4b5563;
+  }
+
+  .feed-reply-text {
+    border-color: #4b5563;
+    background: #111827;
+    color: #e5e7eb;
+  }
+}

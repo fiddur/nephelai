@@ -44,6 +44,7 @@ import { identityToActorUri, identityToHandle, renderChallengeShareHtml } from '
 import { resolveActivityScalars } from './feed-activity.ts'
 import { addressingFor, feedPostContent, formatActivityWindow, isPubliclyVisible } from './object.ts'
 import { quantExerciseExtension, withQuantJsonLd } from './quant-extension.ts'
+import { type ReplyContentSource, renderReplyContent, replyMentionName } from './reply-object.ts'
 import { dateToTemporalInstant } from './temporal-interop.ts'
 
 /**
@@ -308,18 +309,37 @@ export const deliverFeedUpdate = async (
   await ctx.sendActivity({ identifier: user }, 'followers', update)
 }
 
-/** Build and send the `Delete{Tombstone}` for a removed post to its followers. */
+/**
+ * Build and send the `Delete{Tombstone}` for a removed post to its followers,
+ * and to anyone the post itself tagged.
+ */
 export const deliverFeedDelete = async (
   deps: FeedDeliveryDeps,
   user: string,
-  post: DeliverablePost & { challenge?: ChallengeShare | null },
+  post: DeliverablePost & {
+    challenge?: ChallengeShare | null
+    in_reply_to_actor_uri?: string | null
+    in_reply_to_handle?: string | null
+  },
 ): Promise<void> => {
   const ctx = await deps.federation.createContext(new URL(deps.origin))
   const del = buildFeedDelete(ctx, user, post)
-  // A completion post was also delivered to each tagged winner's inbox (they
-  // need not follow the host), so the Delete goes there too (#1074) — and, like
-  // Create/Update, independently of the followers fan-out (#1079).
-  await sendToFollowersAndMentioned(ctx, user, post.challenge ?? null, del)
+  // A completion post was also delivered to each tagged winner's inbox, and a
+  // reply to the inbox of the author it answered (neither need follow us), so
+  // the Delete goes there too (#1074) — and, like Create/Update, independently
+  // of the followers fan-out (#1079).
+  await sendToFollowersAndMentioned(
+    ctx,
+    user,
+    [
+      ...(post.challenge == null ? [] : challengeMentions(post.challenge)),
+      ...replyMentions({
+        in_reply_to_actor_uri: post.in_reply_to_actor_uri ?? null,
+        in_reply_to_handle: post.in_reply_to_handle ?? null,
+      }),
+    ],
+    del,
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -486,8 +506,12 @@ export const toDeliverableChallenge = (post: FeedPostRecord): DeliverableChallen
       }
     : null
 
-/** A winner a completion post tags: the actor id the `Mention` points at and its `@user@host` name. */
-export interface ChallengeMention {
+/**
+ * Someone an activity tags: the actor id the `Mention` points at and its
+ * `@user@host` name. A completion post tags its winners; a reply tags the
+ * author of the post it answers.
+ */
+export interface MentionRecipient {
   actorUri: URL
   handle: string
 }
@@ -497,9 +521,9 @@ export interface ChallengeMention {
  * invitation (no result) mentions nobody. A member whose identity can't be
  * mapped to an actor is left out rather than tagged with a broken href.
  */
-export const challengeMentions = (challenge: ChallengeShare): ChallengeMention[] => {
+export const challengeMentions = (challenge: ChallengeShare): MentionRecipient[] => {
   if (challenge.result == null) return []
-  const mentions: ChallengeMention[] = []
+  const mentions: MentionRecipient[] = []
   for (const entry of challengeWinners(challenge.result)) {
     const actorUri = identityToActorUri(entry.identity_base_url)
     const handle = identityToHandle(entry.identity_base_url)
@@ -519,7 +543,7 @@ const challengeAddressing = (
   ctx: Context<void>,
   user: string,
   post: DeliverableChallenge,
-): { to: URL[]; cc: URL[]; mentions: ChallengeMention[] } => {
+): { to: URL[]; cc: URL[]; mentions: MentionRecipient[] } => {
   const { cc, to } = recipients(post.visibility, ctx.getFollowersUri(user))
   const mentions = challengeMentions(post.challenge)
   return { cc: [...cc, ...mentions.map((m) => m.actorUri)], mentions, to }
@@ -583,54 +607,59 @@ export const buildChallengeNoteUpdate = (
 }
 
 /**
- * Deliver an activity to each mentioned winner's own inbox (besides the
- * followers fan-out), so a winner who doesn't follow the host is still told.
- * The host themself is skipped (their own feed already has the post). Each
- * lookup/POST is best-effort and independent: one unreachable winner never
- * costs another their notification. Remote servers dedupe by activity id, so a
- * winner who is also a follower sees it once.
+ * Deliver an activity to each mentioned actor's own inbox (besides the
+ * followers fan-out), so someone who doesn't follow us is still told: a
+ * challenge winner, or the author of the post a reply answers. We ourselves
+ * are skipped (our own feed already has the post). Each lookup/POST is
+ * best-effort and independent: one unreachable recipient never costs another
+ * their notification. Remote servers dedupe by activity id, so a mentioned
+ * follower sees it once.
+ *
+ * The actor is dereferenced by its id (`lookupObject`) rather than read off
+ * anything inline, so the inbox we POST to is the one that id's own server
+ * publishes.
  */
 const deliverToMentioned = async (
   ctx: Context<void>,
   user: string,
-  challenge: ChallengeShare,
+  mentions: MentionRecipient[],
   activity: Activity,
 ): Promise<void> => {
   const self = ctx.getActorUri(user).href
-  for (const mention of challengeMentions(challenge)) {
+  for (const mention of mentions) {
     if (mention.actorUri.href === self) continue
     try {
       const actor = await ctx.lookupObject(mention.actorUri)
       if (!isActor(actor)) {
         // `lookupObject` yields null (not an error) when the actor document can't
         // be loaded.
-        console.warn(`⚠️ Challenge result delivery to ${mention.handle} skipped: actor not resolvable`)
+        console.warn(`⚠️ Mention delivery to ${mention.handle} skipped: actor not resolvable`)
         continue
       }
       await ctx.sendActivity({ identifier: user }, actor, activity)
     } catch (error) {
-      console.warn(`⚠️ Challenge result delivery to ${mention.handle} failed:`, error)
+      console.warn(`⚠️ Mention delivery to ${mention.handle} failed:`, error)
     }
   }
 }
 
 /**
- * Fan an activity out to followers and, for a completion post, to each tagged
- * winner — as two independent deliveries. Without an outbox queue Fedify
- * awaits every follower inbox and one dead instance rejects the whole send,
- * which used to cancel the winner delivery that exists precisely for members
- * who don't follow the host (#1079). Both run concurrently; a followers
- * failure still surfaces to the caller after both have settled.
+ * Fan an activity out to followers and to each tagged actor — as two
+ * independent deliveries. Without an outbox queue Fedify awaits every follower
+ * inbox and one dead instance rejects the whole send, which used to cancel the
+ * mention delivery that exists precisely for people who don't follow us
+ * (#1079). Both run concurrently; a followers failure still surfaces to the
+ * caller after both have settled.
  */
 const sendToFollowersAndMentioned = async (
   ctx: Context<void>,
   user: string,
-  challenge: ChallengeShare | null,
+  mentions: MentionRecipient[],
   activity: Activity,
 ): Promise<void> => {
   const [followers] = await Promise.allSettled([
     ctx.sendActivity({ identifier: user }, 'followers', activity),
-    challenge && challenge.result ? deliverToMentioned(ctx, user, challenge, activity) : Promise.resolve(),
+    mentions.length > 0 ? deliverToMentioned(ctx, user, mentions, activity) : Promise.resolve(),
   ])
   if (followers.status === 'rejected') throw followers.reason
 }
@@ -646,7 +675,7 @@ export const deliverFeedChallengePost = async (
 ): Promise<void> => {
   const ctx = await deps.federation.createContext(new URL(deps.origin))
   const create = buildChallengeNoteCreate(ctx, user, post)
-  await sendToFollowersAndMentioned(ctx, user, post.challenge, create)
+  await sendToFollowersAndMentioned(ctx, user, challengeMentions(post.challenge), create)
 }
 
 /** Build and send the `Update{Note}` for an edited challenge share to followers (and tagged winners). */
@@ -657,5 +686,143 @@ export const deliverFeedChallengeUpdate = async (
 ): Promise<void> => {
   const ctx = await deps.federation.createContext(new URL(deps.origin))
   const update = buildChallengeNoteUpdate(ctx, user, post)
-  await sendToFollowersAndMentioned(ctx, user, post.challenge, update)
+  await sendToFollowersAndMentioned(ctx, user, challengeMentions(post.challenge), update)
+}
+
+// ---------------------------------------------------------------------------
+// Replies (comments). A reply federates as a `Note` with `inReplyTo` pointing at
+// the post it answers and a `Mention` of that post's author — exactly how
+// Mastodon threads a reply. It is delivered to our followers AND to the
+// author's own inbox, because they need not follow us. Served on the SAME
+// object path as every other post kind, so it tombstones like any post.
+// ---------------------------------------------------------------------------
+
+/** The delivery-facing view of a reply post (its reply target guaranteed present). */
+export interface DeliverableReply {
+  id: string
+  visibility: FeedVisibility
+  created_at: Date
+  updated_at: Date
+  message: string | null
+  in_reply_to_uri: string
+  in_reply_to_actor_uri: string
+  in_reply_to_handle: string | null
+}
+
+/** Narrow a stored feed post to a `DeliverableReply`, or null when it isn't one. */
+export const toDeliverableReply = (post: FeedPostRecord): DeliverableReply | null =>
+  post.kind === 'reply' && post.in_reply_to_uri != null && post.in_reply_to_actor_uri != null
+    ? {
+        created_at: post.created_at,
+        id: post.id,
+        in_reply_to_actor_uri: post.in_reply_to_actor_uri,
+        in_reply_to_handle: post.in_reply_to_handle,
+        in_reply_to_uri: post.in_reply_to_uri,
+        message: post.message,
+        updated_at: post.updated_at,
+        visibility: post.visibility,
+      }
+    : null
+
+/**
+ * The single actor a reply tags: the author of the post it answers. Empty when
+ * the target author isn't known (nothing to tag, and no bogus href).
+ */
+export const replyMentions = (
+  post: Pick<ReplyContentSource, 'in_reply_to_actor_uri' | 'in_reply_to_handle'>,
+): MentionRecipient[] => {
+  if (post.in_reply_to_actor_uri == null) return []
+  let actorUri: URL
+  try {
+    actorUri = new URL(post.in_reply_to_actor_uri)
+  } catch {
+    return []
+  }
+  return [{ actorUri, handle: replyMentionName({ ...post, message: null }) }]
+}
+
+/**
+ * Addressing for a reply: the visibility table, plus the replied-to author in
+ * `cc` (Mastodon-style — a mention is addressed as well as tagged, so their
+ * server accepts the reply even when they don't follow us).
+ */
+const replyAddressing = (
+  ctx: Context<void>,
+  user: string,
+  post: DeliverableReply,
+): { to: URL[]; cc: URL[]; mentions: MentionRecipient[] } => {
+  const { cc, to } = recipients(post.visibility, ctx.getFollowersUri(user))
+  const mentions = replyMentions(post)
+  return { cc: [...cc, ...mentions.map((m) => m.actorUri)], mentions, to }
+}
+
+/**
+ * Build the Fedify `Note` for a reply: `inReplyTo` the answered object, the
+ * mention link + the author's markdown as `content`, addressed per visibility,
+ * at the post's canonical Note id, with the target author as a `Mention` tag.
+ * Synchronous — nothing to resolve.
+ */
+export const buildReplyNote = (ctx: Context<void>, user: string, post: DeliverableReply): Note => {
+  const noteId = ctx.getObjectUri(Note, { identifier: user, postId: post.id })
+  const { cc, mentions, to } = replyAddressing(ctx, user, post)
+  return new Note({
+    attribution: ctx.getActorUri(user),
+    ccs: cc,
+    content: renderReplyContent(post),
+    id: noteId,
+    published: dateToTemporalInstant(post.created_at),
+    replyTarget: new URL(post.in_reply_to_uri),
+    tags: mentions.map((m) => new Mention({ href: m.actorUri, name: m.handle })),
+    tos: to,
+    url: noteId,
+  })
+}
+
+/** Wrap the reply Note in the `Create` delivered to followers + the author, and listed in the outbox. */
+export const buildReplyNoteCreate = (ctx: Context<void>, user: string, post: DeliverableReply): Create => {
+  const noteId = ctx.getObjectUri(Note, { identifier: user, postId: post.id })
+  const { cc, to } = replyAddressing(ctx, user, post)
+  return new Create({
+    actor: ctx.getActorUri(user),
+    ccs: cc,
+    id: new URL(`${noteId.href}#create`),
+    object: buildReplyNote(ctx, user, post),
+    published: dateToTemporalInstant(post.created_at),
+    tos: to,
+  })
+}
+
+/** Wrap the reply Note in an `Update`; id carries `updated_at` so each edit is distinct. */
+export const buildReplyNoteUpdate = (ctx: Context<void>, user: string, post: DeliverableReply): Update => {
+  const noteId = ctx.getObjectUri(Note, { identifier: user, postId: post.id })
+  const { cc, to } = replyAddressing(ctx, user, post)
+  return new Update({
+    actor: ctx.getActorUri(user),
+    ccs: cc,
+    id: new URL(`${noteId.href}#update-${post.updated_at.getTime()}`),
+    object: buildReplyNote(ctx, user, post),
+    tos: to,
+  })
+}
+
+/** Build and send the `Create{Note}` for a fresh reply to followers and the answered author. */
+export const deliverFeedReplyPost = async (
+  deps: FeedDeliveryDeps,
+  user: string,
+  post: DeliverableReply,
+): Promise<void> => {
+  const ctx = await deps.federation.createContext(new URL(deps.origin))
+  const create = buildReplyNoteCreate(ctx, user, post)
+  await sendToFollowersAndMentioned(ctx, user, replyMentions(post), create)
+}
+
+/** Build and send the `Update{Note}` for an edited reply to followers and the answered author. */
+export const deliverFeedReplyUpdate = async (
+  deps: FeedDeliveryDeps,
+  user: string,
+  post: DeliverableReply,
+): Promise<void> => {
+  const ctx = await deps.federation.createContext(new URL(deps.origin))
+  const update = buildReplyNoteUpdate(ctx, user, post)
+  await sendToFollowersAndMentioned(ctx, user, replyMentions(post), update)
 }

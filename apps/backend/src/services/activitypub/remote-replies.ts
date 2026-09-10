@@ -21,14 +21,20 @@ const MAX_REPLIES = 20
 const MAX_FETCHES = 15
 const AP_ACCEPT = 'application/activity+json, application/ld+json; q=0.9'
 
+/**
+ * Total wall-clock budget for one thread snapshot (root object + collection
+ * pages + author lookups). Shared by the REST route and the MCP tool so the two
+ * surfaces can't drift on how long a slow origin may hold a request.
+ */
+export const REPLIES_TIMEOUT_MS = 12_000
+
 export interface RemoteRepliesDeps {
   /** Fetch + JSON-decode an ActivityPub URL (SSRF-guarded). */
   fetchJson: (url: string) => Promise<unknown>
 }
 
 export const realRemoteRepliesDeps: RemoteRepliesDeps = {
-  fetchJson: async (url) =>
-    (await safeFetchGet(url, { headers: { Accept: AP_ACCEPT } })).data,
+  fetchJson: async (url) => (await safeFetchGet(url, { headers: { Accept: AP_ACCEPT } })).data,
 }
 
 type JsonRecord = Record<string, unknown>
@@ -190,6 +196,9 @@ const toReply = async (
     content: sanitizeRemoteHtml(content),
     display_name: author?.display_name ?? null,
     handle: author?.handle ?? null,
+    // The origin-checked canonical id, so a merge can tell one of OUR OWN
+    // replies (already listed by the origin) from one we still have to add.
+    object_uri: objId,
     published_at: isoOrNull(obj.published),
     url: httpsOnly(typeof obj.url === 'string' ? obj.url : objId),
   }
@@ -197,30 +206,44 @@ const toReply = async (
 
 /**
  * Fetch up to {@link MAX_REPLIES} replies to the post at `objectUri`, oldest
- * first as the origin orders them. `partial` is true when a budget (reply
- * count, fetch count) ended the walk before the collection did.
+ * first as the origin orders them.
+ *
+ * - `partial` — a budget (reply count, fetch count) ended the walk before the
+ *   collection did.
+ * - `fetched` — the origin's thread was actually READ. False when the post
+ *   itself never loaded (unparseable id, fetch threw, non-JSON, budget gone) or
+ *   when it declared a `replies` collection we couldn't resolve. An empty list
+ *   with `fetched: false` means "unknown", not "no replies" (#1065) — the two
+ *   read very differently to a person.
  */
 export const fetchRemoteReplies = async (
   objectUri: string,
   deps: RemoteRepliesDeps = realRemoteRepliesDeps,
-): Promise<{ partial: boolean; replies: TimelineReply[] }> => {
+): Promise<{ fetched: boolean; partial: boolean; replies: TimelineReply[] }> => {
   const budget: Budget = { exhausted: false, fetches: 0 }
   const authors = new Map<string, { display_name: string | null; handle: string | null }>()
   const replies: TimelineReply[] = []
 
   const postHost = hostOf(objectUri)
-  if (postHost == null) return { partial: false, replies }
+  if (postHost == null) return { fetched: false, partial: false, replies }
   const post = await budgetedFetch(deps, budget, objectUri)
-  if (!isRecord(post)) return { partial: budget.exhausted, replies }
+  if (!isRecord(post)) return { fetched: false, partial: budget.exhausted, replies }
 
-  let ctx = await resolveFirstPage(deps, budget, post, postHost)
+  // A post that declares no `replies` collection HAS been read — it simply has
+  // no thread to walk. One that declares one we can't resolve has not.
+  let ctx: PageCtx | null = null
+  let fetched = true
+  if (post.replies != null) {
+    ctx = await resolveFirstPage(deps, budget, post, postHost)
+    fetched = ctx != null
+  }
   while (ctx != null && replies.length < MAX_REPLIES) {
     await collectPageReplies(deps, budget, ctx, authors, replies)
     if (replies.length >= MAX_REPLIES || ctx.page.next == null) break
     ctx = await resolvePage(deps, budget, ctx.page.next, ctx.host)
   }
   const partial = budget.exhausted || replies.length >= MAX_REPLIES
-  return { partial, replies }
+  return { fetched, partial, replies }
 }
 
 /**

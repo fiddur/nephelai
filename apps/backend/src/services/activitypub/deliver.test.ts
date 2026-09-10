@@ -9,15 +9,20 @@ import {
   buildChallengeNote,
   buildChallengeNoteCreate,
   buildFeedDelete,
+  buildReplyNote,
+  buildReplyNoteCreate,
   challengeMentions,
   type DeliverableArticle,
   type DeliverableChallenge,
   type DeliverablePost,
+  type DeliverableReply,
   deliverFeedChallengePost,
   deliverFeedDelete,
+  deliverFeedReplyPost,
   type FeedDeliveryDeps,
   imageAttachments,
   recipients,
+  toDeliverableReply,
 } from './deliver.ts'
 import { createFeedFederation } from './federation.ts'
 
@@ -401,5 +406,174 @@ describe('completion-post fan-out to tagged winners (#1074, #1079)', () => {
     expect(sentTo(sendActivity)).toEqual(['followers'])
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('actor not resolvable'))
     warn.mockRestore()
+  })
+})
+
+describe('buildReplyNote / buildReplyNoteCreate', () => {
+  const ORIGIN = 'https://aurboda.example'
+  const TARGET = 'https://mastodon.example/users/alice/statuses/9'
+  const TARGET_ACTOR = 'https://mastodon.example/users/alice'
+  const contextFor = () => createFeedFederation(ORIGIN, `${ORIGIN}/api`).createContext(new URL(ORIGIN))
+
+  const deliverableReply = (
+    visibility: DeliverableReply['visibility'] = 'unlisted',
+    over: Partial<DeliverableReply> = {},
+  ): DeliverableReply => ({
+    created_at: new Date('2026-09-01T00:00:00Z'),
+    id: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
+    in_reply_to_actor_uri: TARGET_ACTOR,
+    in_reply_to_handle: '@alice@mastodon.example',
+    in_reply_to_uri: TARGET,
+    message: 'Nice **run**!',
+    updated_at: new Date('2026-09-01T00:00:00Z'),
+    visibility,
+    ...over,
+  })
+
+  test('is a Note at the canonical post id, inReplyTo the target, mention + prose content', async () => {
+    const ctx = await contextFor()
+    const post = deliverableReply()
+    const note = buildReplyNote(ctx, 'fiddur', post)
+
+    const noteId = `${ORIGIN}/users/fiddur/feed/${post.id}`
+    expect(note).toBeInstanceOf(Note)
+    expect(note.id?.href).toBe(noteId)
+    expect(note.url?.href).toBe(noteId)
+    expect(hrefs([...note.replyTargetIds])).toEqual([TARGET])
+    const content = note.content?.toString() ?? ''
+    expect(content).toContain(`<a href="${TARGET_ACTOR}" class="u-url mention">@alice@mastodon.example</a>`)
+    expect(content).toContain('<strong>run</strong>')
+    // Unlisted: followers in `to`, Public in `cc` — plus the mentioned author.
+    expect(hrefs([...note.toIds])).toEqual([`${ORIGIN}/users/fiddur/followers`])
+    expect(hrefs([...note.ccIds])).toContain(TARGET_ACTOR)
+  })
+
+  test('tags the replied-to author with a Mention naming their handle', async () => {
+    const ctx = await contextFor()
+    const note = buildReplyNote(ctx, 'fiddur', deliverableReply())
+    const tags = []
+    for await (const tag of note.getTags()) tags.push(tag)
+    expect(tags).toHaveLength(1)
+    const mention = tags[0]
+    expect(mention).toBeInstanceOf(Mention)
+    expect(mention instanceof Mention ? mention.href?.href : null).toBe(TARGET_ACTOR)
+    expect(mention instanceof Mention ? mention.name?.toString() : null).toBe('@alice@mastodon.example')
+  })
+
+  test('falls back to a handle derived from the actor URI when none was snapshotted', async () => {
+    const ctx = await contextFor()
+    const note = buildReplyNote(ctx, 'fiddur', deliverableReply('unlisted', { in_reply_to_handle: null }))
+    expect(note.content?.toString()).toContain('@alice@mastodon.example')
+  })
+
+  test('the Create wraps the Note with a distinct #create id and cc’s the author', async () => {
+    const ctx = await contextFor()
+    const post = deliverableReply('public')
+    const create = buildReplyNoteCreate(ctx, 'fiddur', post)
+    expect(create.id?.href).toBe(`${ORIGIN}/users/fiddur/feed/${post.id}#create`)
+    expect(hrefs([...create.toIds])).toContain(PUBLIC)
+    expect(hrefs([...create.ccIds])).toContain(TARGET_ACTOR)
+    const object = await create.getObject()
+    expect(object).toBeInstanceOf(Note)
+  })
+
+  test('a followers-only reply never addresses Public, but still reaches the author', async () => {
+    const ctx = await contextFor()
+    const note = buildReplyNote(ctx, 'fiddur', deliverableReply('followers'))
+    expect(hrefs([...note.toIds])).not.toContain(PUBLIC)
+    expect(hrefs([...note.ccIds])).toEqual([TARGET_ACTOR])
+  })
+
+  test('toDeliverableReply narrows only a reply post with a resolved target', () => {
+    const base = {
+      activity_id: null,
+      article: null,
+      autoshare_rule_id: null,
+      challenge: null,
+      created_at: new Date(),
+      id: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
+      image_token: 'tok',
+      include_chart: false,
+      include_map: false,
+      included_metrics: [],
+      in_reply_to_actor_uri: TARGET_ACTOR,
+      in_reply_to_handle: '@alice@mastodon.example',
+      in_reply_to_uri: TARGET,
+      message: 'hi',
+      series_metrics: [],
+      updated_at: new Date(),
+      visibility: 'unlisted' as const,
+    }
+    expect(toDeliverableReply({ ...base, kind: 'reply' })?.in_reply_to_uri).toBe(TARGET)
+    expect(toDeliverableReply({ ...base, kind: 'activity' })).toBeNull()
+    expect(toDeliverableReply({ ...base, in_reply_to_uri: null, kind: 'reply' })).toBeNull()
+  })
+})
+
+describe('reply fan-out to the answered author (#1079 shape)', () => {
+  const ORIGIN = 'https://aurboda.example'
+  const TARGET_ACTOR = 'https://mastodon.example/users/alice'
+  const reply = (): DeliverableReply => ({
+    created_at: new Date('2026-09-01T00:00:00Z'),
+    id: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
+    in_reply_to_actor_uri: TARGET_ACTOR,
+    in_reply_to_handle: '@alice@mastodon.example',
+    in_reply_to_uri: 'https://mastodon.example/users/alice/statuses/9',
+    message: 'hi',
+    updated_at: new Date('2026-09-01T00:00:00Z'),
+    visibility: 'unlisted',
+  })
+
+  const fakeDeps = async (overrides: { lookupObject?: unknown; sendActivity?: unknown } = {}) => {
+    const ctx = await createFeedFederation(ORIGIN, `${ORIGIN}/api`).createContext(new URL(ORIGIN))
+    const sendActivity = vi.fn().mockResolvedValue(undefined)
+    const lookupObject = vi.fn().mockResolvedValue(new Person({ id: new URL(TARGET_ACTOR) }))
+    Object.assign(ctx, { lookupObject, sendActivity, ...overrides })
+    const deps: FeedDeliveryDeps = {
+      apiBaseUrl: `${ORIGIN}/api`,
+      federation: { createContext: async () => ctx } as unknown as FeedDeliveryDeps['federation'],
+      origin: ORIGIN,
+    }
+    return { deps, lookupObject, sendActivity }
+  }
+
+  const sentTo = (sendActivity: ReturnType<typeof vi.fn>) =>
+    sendActivity.mock.calls.map(([, recipient]) =>
+      typeof recipient === 'string' ? recipient : recipient.id?.href,
+    )
+
+  test('the Create reaches followers AND the author’s own inbox', async () => {
+    const { deps, sendActivity } = await fakeDeps()
+    await deliverFeedReplyPost(deps, 'fiddur', reply())
+    expect(sentTo(sendActivity).sort()).toEqual(['followers', TARGET_ACTOR])
+  })
+
+  test('a dead follower inbox no longer cancels the author delivery, and still surfaces', async () => {
+    const sendActivity = vi.fn(async (_sender: unknown, recipient: unknown) => {
+      if (recipient === 'followers') throw new Error('connect ECONNREFUSED')
+    })
+    const { deps } = await fakeDeps({ sendActivity })
+    await expect(deliverFeedReplyPost(deps, 'fiddur', reply())).rejects.toThrow('ECONNREFUSED')
+    expect(sentTo(sendActivity).sort()).toEqual(['followers', TARGET_ACTOR])
+  })
+
+  test('the Delete of a reply is retracted from the author too', async () => {
+    const { deps, sendActivity } = await fakeDeps()
+    const post = reply()
+    await deliverFeedDelete(deps, 'fiddur', {
+      created_at: post.created_at,
+      id: post.id,
+      image_token: 'tok',
+      in_reply_to_actor_uri: post.in_reply_to_actor_uri,
+      in_reply_to_handle: post.in_reply_to_handle,
+      include_chart: false,
+      include_map: false,
+      included_metrics: [],
+      series_metrics: [],
+      updated_at: post.updated_at,
+      visibility: 'unlisted',
+    })
+    expect(sentTo(sendActivity).sort()).toEqual(['followers', TARGET_ACTOR])
+    for (const [, , activity] of sendActivity.mock.calls) expect(activity).toBeInstanceOf(Delete)
   })
 })

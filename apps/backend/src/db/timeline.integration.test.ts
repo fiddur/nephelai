@@ -7,6 +7,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
 import { cleanTestDb, getTestUser, startTestDb, stopTestDb } from '../test/db-test-helper.ts'
 import { query } from './connection.ts'
 import {
+  countTimelineRepliesTo,
   deleteBoostEntry,
   deleteTimelineEntriesByActor,
   deleteTimelineEntryByUri,
@@ -14,6 +15,7 @@ import {
   getTimelineEntryByObjectUri,
   listReplyUncheckedEntries,
   listTimelineEntries,
+  listTimelineRepliesTo,
   listUnenrichedAurbodaEntries,
   markEnrichTransientFailure,
   setTimelineEntryReplyInfo,
@@ -431,6 +433,53 @@ describe('Timeline store integration', () => {
       // Bob's boost of alice's post survives — that's in the timeline because of
       // the (still active) follow of Bob.
       expect((await listTimelineEntries(user, 10)).map((e) => e.object_uri)).toEqual([ANNOUNCE])
+    })
+  })
+  describe('replies to one object (comments under an own post)', () => {
+    const TARGET = 'https://aurboda.example/users/fiddur/feed/11111111-1111-4111-8111-111111111111'
+    const OTHER = 'https://aurboda.example/users/fiddur/feed/22222222-2222-4222-8222-222222222222'
+
+    test('lists a target’s replies oldest-first, ignoring other targets and top-level posts', async () => {
+      const user = getTestUser()
+      const second = await upsertTimelineEntry(
+        user,
+        entry(2, { in_reply_to_uri: TARGET, published_at: new Date('2026-07-01T11:00:00Z') }),
+      )
+      const first = await upsertTimelineEntry(
+        user,
+        entry(1, { in_reply_to_uri: TARGET, published_at: new Date('2026-07-01T10:00:00Z') }),
+      )
+      await upsertTimelineEntry(user, entry(3, { in_reply_to_uri: OTHER }))
+      await upsertTimelineEntry(user, entry(4))
+
+      const replies = await listTimelineRepliesTo(user, TARGET, 100)
+      expect(replies.map((r) => r.id)).toEqual([first.id, second.id])
+    })
+
+    test('respects the limit', async () => {
+      const user = getTestUser()
+      await upsertTimelineEntry(user, entry(1, { in_reply_to_uri: TARGET }))
+      await upsertTimelineEntry(user, entry(2, { in_reply_to_uri: TARGET }))
+      expect(await listTimelineRepliesTo(user, TARGET, 1)).toHaveLength(1)
+    })
+
+    test('countTimelineRepliesTo tallies many targets in one query, omitting empty ones', async () => {
+      const user = getTestUser()
+      await upsertTimelineEntry(user, entry(1, { in_reply_to_uri: TARGET }))
+      await upsertTimelineEntry(user, entry(2, { in_reply_to_uri: TARGET }))
+      await upsertTimelineEntry(user, entry(3, { in_reply_to_uri: OTHER }))
+
+      const counts = await countTimelineRepliesTo(user, [TARGET, OTHER, `${OTHER}x`])
+      expect(new Map(counts.map((c) => [c.in_reply_to_uri, c.count]))).toEqual(
+        new Map([
+          [TARGET, 2],
+          [OTHER, 1],
+        ]),
+      )
+    })
+
+    test('countTimelineRepliesTo short-circuits on an empty list', async () => {
+      expect(await countTimelineRepliesTo(getTestUser(), [])).toEqual([])
     })
   })
 })

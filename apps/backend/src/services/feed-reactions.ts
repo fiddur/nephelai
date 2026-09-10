@@ -1,5 +1,6 @@
 /**
- * Outbound likes ⭐ and boosts 🔄 — the user tapping a home-timeline card.
+ * Outbound likes ⭐, boosts 🔄 and replies 🗨 — the user acting on a
+ * home-timeline card.
  *
  * A like is an AS2 `Like` (Mastodon's "favourite"), a boost an AS2 `Announce`
  * ("reblog"); both are retracted with an `Undo` of the same activity. The local
@@ -14,6 +15,11 @@
  *   independent sends so one dead inbox can't cancel the other (the same shape
  *   `sendToFollowersAndMentioned` uses).
  *
+ * A reply is neither: it is a feed POST of kind `reply` (an AS2
+ * `Create{Note inReplyTo}` that `Mention`s the author), so it federates through
+ * the shared feed-post delivery hook rather than these builders — see
+ * `reply` at the bottom of this module.
+ *
  * Delivery is best-effort and synchronous, like `followActor`: a failed POST is
  * logged and the local state stands, so the card never lies about what the user
  * did on this instance.
@@ -21,15 +27,23 @@
  * The activity builders below are pure (plain URLs in, vocab objects out), so
  * they unit-test with no database and no network.
  */
-import type { FeedPostReaction, FeedReactionKind, TimelineEntry } from '@aurboda/api-spec'
+import type {
+  FeedPost,
+  FeedPostReaction,
+  FeedReactionKind,
+  ReplyToPostBody,
+  TimelineEntry,
+} from '@aurboda/api-spec'
 import type { Federation } from '@fedify/fedify'
 import type { Actor } from '@fedify/fedify/vocab'
 
 import { Announce, isActor, Like, Undo } from '@fedify/fedify/vocab'
 
 import type { FeedPostReactionRecord, FeedReactionRecord, TimelineEntryRecord } from '../db/index.ts'
+import type { FeedDeliver } from '../routes/feed-router.ts'
 
 import {
+  createReplyPost,
   getFeedFollowingByActor,
   getFeedReaction,
   getTimelineEntryById,
@@ -37,7 +51,9 @@ import {
   removeFeedReaction,
 } from '../db/index.ts'
 import { AS_PUBLIC } from './activitypub/object.ts'
+import { actorUriToHandle } from './activitypub/reply-object.ts'
 import { dateToTemporalInstant } from './activitypub/temporal-interop.ts'
+import { serializeFeedPost } from './feed.ts'
 import { loadReactionsForRows, ownObjectPrefix, reactionTarget, serializeTimelineEntry } from './timeline.ts'
 import { withTimeout } from './with-timeout.ts'
 
@@ -57,6 +73,13 @@ export interface ReactionDeps {
 export type ReactionResult = { ok: true; entry: TimelineEntry } | { ok: false; status: number; error: string }
 
 /**
+ * Outcome of a reply. Same failure contract as `ReactionResult`; success
+ * carries the created feed post (a reply IS a post of kind `reply`), so the
+ * client can render it without a refetch.
+ */
+export type ReplyResult = { ok: true; post: FeedPost } | { ok: false; status: number; error: string }
+
+/**
  * The network-requiring reaction operations, injected into the REST router + MCP
  * tools (mirroring `FollowActions`) so those layers stay decoupled from the
  * ActivityPub context and testable without it. Each takes the **timeline entry's
@@ -67,6 +90,8 @@ export interface ReactionActions {
   unlike: (user: string, entryId: string) => Promise<ReactionResult>
   boost: (user: string, entryId: string) => Promise<ReactionResult>
   unboost: (user: string, entryId: string) => Promise<ReactionResult>
+  /** Publish a reply to the post a card shows, delivered to followers AND its author. */
+  reply: (user: string, entryId: string, body: ReplyToPostBody) => Promise<ReplyResult>
 }
 
 /**
@@ -331,10 +356,56 @@ export const serializeFeedPostReaction = (record: FeedPostReactionRecord): FeedP
   kind: record.kind,
 })
 
-/** Bind the reaction operations to one federation + origin (wired once in `api.ts`). */
-export const createReactionActions = (deps: ReactionDeps): ReactionActions => ({
+/**
+ * Reply to the post a home-timeline card shows: store a `reply` feed post whose
+ * target is resolved from the card (never from the request), then fan the
+ * `Create{Note inReplyTo}` out through the same delivery hook every other post
+ * kind uses.
+ *
+ * The target of a BOOST card is the ORIGINAL Note and its original author
+ * (`reactionTarget` / the entry's author columns), exactly as a like or boost
+ * resolves it — replying to a boost replies to the post it shows.
+ *
+ * The author's inbox is resolved BEFORE the row is written (cached followee row
+ * first, else a bounded actor lookup): a reply we can't address is a 502, so no
+ * post is left claiming to answer someone who was never told.
+ */
+const reply = async (
+  deps: ReactionDeps,
+  user: string,
+  entryId: string,
+  body: ReplyToPostBody,
+  deliver?: FeedDeliver,
+): Promise<ReplyResult> => {
+  const entry = await getTimelineEntryById(user, entryId)
+  if (entry == null) return { error: 'Timeline entry not found', ok: false, status: 404 }
+  const message = body.message.trim()
+  if (message === '') return { error: 'A reply needs some text.', ok: false, status: 400 }
+  if ((await resolveAuthorInbox(deps, user, entry.actor_uri)) == null) {
+    return { error: 'Couldn’t reach the author’s server. Please try again later.', ok: false, status: 502 }
+  }
+  const record = await createReplyPost(user, {
+    in_reply_to_actor_uri: entry.actor_uri,
+    // The handle names the federated `Mention`; the ingest-time snapshot when we
+    // have one, else derived from the actor URI (an unnamed mention is worse).
+    in_reply_to_handle: entry.handle ?? actorUriToHandle(entry.actor_uri),
+    in_reply_to_uri: reactionTarget(entry),
+    message,
+    visibility: body.visibility,
+  })
+  deliver?.createdReply(user, record)
+  return { ok: true, post: await serializeFeedPost(user, record) }
+}
+
+/**
+ * Bind the reaction + reply operations to one federation + origin (wired once
+ * in `api.ts`). `deliver` is the shared feed-post delivery hook, so a reply
+ * federates through exactly the same fire-and-forget boundary as a share.
+ */
+export const createReactionActions = (deps: ReactionDeps, deliver?: FeedDeliver): ReactionActions => ({
   boost: (user, entryId) => react(deps, user, entryId, 'announce'),
   like: (user, entryId) => react(deps, user, entryId, 'like'),
+  reply: (user, entryId, body) => reply(deps, user, entryId, body, deliver),
   unboost: (user, entryId) => unreact(deps, user, entryId, 'announce'),
   unlike: (user, entryId) => unreact(deps, user, entryId, 'like'),
 })

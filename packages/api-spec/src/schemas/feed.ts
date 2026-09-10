@@ -127,17 +127,50 @@ export type UpdateFeedPostBody = z.infer<typeof updateFeedPostBodySchema>
  * The kind of a feed post. `activity` (the default) shares one of the user's
  * activities; `article` is a long-form post carrying markdown prose and inline
  * chart blocks over locked time windows; `challenge` invites people to a
- * challenge (a personal note plus the challenge's canonical join-by-URL link).
- * Modelled as a post *kind* rather than a separate entity so every kind reuses
- * the whole feed (visibility, federation, home timeline, the public-profile
- * feed, permalinks).
+ * challenge (a personal note plus the challenge's canonical join-by-URL link);
+ * `reply` is a Mastodon-style comment on another post (`inReplyTo` + a `Mention`
+ * of its author). Modelled as a post *kind* rather than a separate entity so
+ * every kind reuses the whole feed (visibility, federation, home timeline, the
+ * public-profile feed, permalinks).
  */
-export const feedPostKindSchema = z.enum(['activity', 'article', 'challenge']).meta({
-  description: 'Feed post kind: an activity share, a long-form article, or a challenge invitation',
+export const feedPostKindSchema = z.enum(['activity', 'article', 'challenge', 'reply']).meta({
+  description:
+    'Feed post kind: an activity share, a long-form article, a challenge invitation, or a reply to another post',
   id: 'FeedPostKind',
 })
 
 export type FeedPostKind = z.infer<typeof feedPostKindSchema>
+
+// =============================================================================
+// Reply posts (comment on another post — AS2 `Create{Note inReplyTo}`)
+// =============================================================================
+
+/**
+ * Body for replying to a post in the home timeline. The reply target (the
+ * object id, its author's actor URI and `@user@host` handle) is resolved
+ * server-side from the addressed timeline entry, never client-supplied, so a
+ * reply can never claim to answer a post it doesn't.
+ *
+ * `visibility` defaults to `unlisted`, matching Mastodon's convention that a
+ * reply belongs to its thread rather than on public timelines; the author can
+ * still choose `public` or `followers`.
+ */
+export const replyToPostBodySchema = z
+  .object({
+    message: z
+      .string()
+      .min(1)
+      .max(feedPostMessageMaxLength)
+      .refine((text) => text.trim().length > 0, { message: 'Reply text cannot be blank' })
+      .meta({
+        description:
+          'The reply text (markdown, rendered through the shared sanitiser). Must be non-blank after trimming.',
+      }),
+    visibility: feedVisibilitySchema.default('unlisted'),
+  })
+  .meta({ id: 'ReplyToPostBody' })
+
+export type ReplyToPostBody = z.infer<typeof replyToPostBodySchema>
 
 // =============================================================================
 // Challenge posts (share a challenge to the feed — #994)
@@ -365,6 +398,19 @@ export const feedPostSchema = z
     include_chart: z.boolean().meta({ description: 'Whether a chart image is attached' }),
     include_map: z.boolean().meta({ description: 'Whether a route-map image is attached' }),
     included_metrics: z.array(z.string()).meta({ description: 'Shared scalar-summary metric keys' }),
+    // Present only for `reply` posts: what this post answers. The handle is a
+    // snapshot taken at reply time (it names the federated `Mention`), the same
+    // rule `TimelineEntry.handle` follows.
+    in_reply_to_actor_uri: z.string().optional().meta({
+      description: "The replied-to post author's actor URI, present only for `reply` posts",
+    }),
+    in_reply_to_handle: z.string().optional().meta({
+      description: "The replied-to post author's `@user@host` handle at reply time (`reply` posts)",
+    }),
+    in_reply_to_uri: z
+      .string()
+      .optional()
+      .meta({ description: 'The replied-to object id, present only for `reply` posts' }),
     kind: feedPostKindSchema.meta({ description: 'Post kind (`activity` or `article`)' }),
     like_count: z.number().int().optional().meta({
       description: 'How many remote actors favourited (`Like`d) this post; absent on single-post responses',
@@ -381,6 +427,11 @@ export const feedPostSchema = z
       .array(feedStructuredMetricSchema)
       .optional()
       .meta({ description: 'Resolved typed scalar values for the shared metrics (activity posts)' }),
+    // Attached by the feed LISTING only, like the reaction counts above.
+    reply_count: z.number().int().optional().meta({
+      description:
+        'How many replies (comments) this instance holds for this post; absent on single-post responses',
+    }),
     series_metrics: z.array(z.string()).meta({ description: 'Explicitly-shared series metrics' }),
     structured: feedStructuredPostSchema.optional().meta({
       description:
@@ -744,13 +795,25 @@ export const timelineQuerySchema = z
 
 export type TimelineQuery = z.infer<typeof timelineQuerySchema>
 
-/** One reply fetched live from a remote post's `replies` collection. */
+/**
+ * One reply in a post's thread snapshot: fetched live from the origin's
+ * `replies` collection, or one of the reader's OWN replies merged in (`mine`)
+ * — the origin may not list ours yet, and a thread that hides its own author's
+ * reply reads as if it were never sent.
+ */
 export const timelineReplySchema = z
   .object({
     actor_uri: z.string().nullable().meta({ description: "The reply author's actor URI, if declared" }),
     content: z.string().meta({ description: 'The reply HTML (sanitised server-side; safe to render)' }),
     display_name: z.string().nullable().meta({ description: "The author's display name, if resolved" }),
     handle: z.string().nullable().meta({ description: "The author's `@user@host` handle, if resolved" }),
+    mine: z.boolean().optional().meta({
+      description: 'Present (and true) when this reply is one YOU published from this instance',
+    }),
+    object_uri: z
+      .string()
+      .nullable()
+      .meta({ description: "The reply's canonical AS2 object id, when it declares one" }),
     published_at: iso8601DateTimeSchema.nullable().meta({ description: 'When the reply was published' }),
     url: z.string().nullable().meta({ description: 'Link to the reply on its origin' }),
   })
@@ -761,6 +824,10 @@ export type TimelineReply = z.infer<typeof timelineReplySchema>
 /** Replies fetched live from the remote post behind one timeline entry. */
 export const timelineRepliesResponseSchema = baseResponseSchema
   .extend({
+    fetched: z.boolean().meta({
+      description:
+        "False when the origin's thread could not be read at all (the post or its first page never loaded) — an empty list then means 'unknown', not 'no replies'",
+    }),
     partial: z.boolean().meta({
       description:
         'True when the fetch hit its budget (count/time) before exhausting the collection — more replies may exist on the origin',
@@ -783,6 +850,23 @@ export const timelineResponseSchema = baseResponseSchema
   .meta({ id: 'TimelineResponse' })
 
 export type TimelineResponse = z.infer<typeof timelineResponseSchema>
+
+/**
+ * The comments under one of the owner's OWN posts: the replies this instance
+ * already holds as timeline entries (ingested from any actor whose Note replied
+ * to that post — #1060), oldest first. No network: the origin of each reply is
+ * whoever delivered it. They are full `TimelineEntry`s, so each carries the
+ * reader's like/boost state and can itself be replied to.
+ */
+export const feedPostRepliesResponseSchema = baseResponseSchema
+  .extend({
+    replies: z
+      .array(timelineEntrySchema)
+      .meta({ description: 'Replies received for this post, oldest first' }),
+  })
+  .meta({ id: 'FeedPostRepliesResponse' })
+
+export type FeedPostRepliesResponse = z.infer<typeof feedPostRepliesResponseSchema>
 
 // =============================================================================
 // Reactions on the owner's own posts (inbound Like / Announce)

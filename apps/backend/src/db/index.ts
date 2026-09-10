@@ -333,6 +333,7 @@ export {
 
 // Home timeline (posts received from followed actors)
 export {
+  countTimelineRepliesTo,
   deleteBoostEntry,
   deleteTimelineEntriesByActor,
   deleteTimelineEntryByUri,
@@ -340,6 +341,7 @@ export {
   getTimelineEntryByObjectUri,
   listReplyUncheckedEntries,
   listTimelineEntries,
+  listTimelineRepliesTo,
   listUnenrichedAurbodaEntries,
   markEnrichTransientFailure,
   markTimelineEntryReplyChecked,
@@ -348,6 +350,7 @@ export {
   type TimelineCursor,
   type TimelineEntryInput,
   type TimelineEntryRecord,
+  type TimelineReplyCount,
   type TimelineReplyFilter,
   type UnenrichedTimelineEntry,
   upsertTimelineEntry,
@@ -362,6 +365,7 @@ export {
   createArticlePost,
   createChallengePost,
   createFeedPost,
+  createReplyPost,
   deleteFeedPost,
   type FeedPostCursor,
   type FeedPostInput,
@@ -374,6 +378,9 @@ export {
   listFeedPosts,
   listPublicFeedPosts,
   listPublicFeedPostsPage,
+  listReplyPostsTo,
+  type PublicFeedPageOpts,
+  type ReplyPostInput,
   updateFeedPost,
 } from './feed.ts'
 
