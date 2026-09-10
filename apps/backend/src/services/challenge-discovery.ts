@@ -31,12 +31,13 @@ import {
   listAcceptedFeedFollowing,
   listChallengeParticipations,
   listChallenges,
+  listLeftChallengeUrls,
   listPublicChallenges,
 } from '../db/index.ts'
 import { isMissingDatabase } from '../db/pg-errors.ts'
-import { discoverInstance } from './challenge-federation.ts'
+import { canonicalChallengeUrl, discoverInstance } from './challenge-federation.ts'
 import { specToApi } from './challenge-spec.ts'
-import { safeFetchGet } from './safe-fetch.ts'
+import { safeFetchGet, SafeFetchError } from './safe-fetch.ts'
 import { buildProfileUrl, buildShareUrl } from './share-urls.ts'
 
 /** How long a peer may take to list its challenges before it counts as unreachable this round. */
@@ -46,6 +47,9 @@ const INSTANCE_TTL_MS = 60 * 60_000
 const DEFAULT_CONCURRENCY = 4
 
 const trimSlashes = (s: string): string => s.replace(/\/+$/, '')
+
+/** The spelling every challenge URL is compared by; unparsable links fall back to their trimmed form. */
+const canonical = (url: string): string => canonicalChallengeUrl(url) ?? trimSlashes(url)
 
 export interface ParsedActorUri {
   base: string
@@ -80,13 +84,39 @@ export const parseActorUri = (actorUri: string): ParsedActorUri | null => {
 /** What a well-known probe of an instance concluded. A transient failure throws instead. */
 export type InstanceProbe = { kind: 'aurboda'; api_base: string } | { kind: 'not_aurboda' }
 
+/** Node network errors that mean "could not reach it right now", not "it is not Aurboda". */
+const TRANSIENT_NETWORK_CODES = new Set([
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EAI_AGAIN',
+  'EHOSTUNREACH',
+  'ENOTFOUND',
+  'ETIMEDOUT',
+])
+
+/** The `code` of a Node system error, if this is one. */
+const systemErrorCode = (error: unknown): string | undefined =>
+  typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string'
+    ? error.code
+    : undefined
+
 /**
  * A failure that says nothing about whether the host is an Aurboda instance —
- * no answer at all, or a server error — as opposed to a definite "no" (a 404 for
- * the well-known document, a non-Aurboda body, a private address we refuse).
+ * no answer at all, a server error, a throttle (429) or a blanket 403, a DNS
+ * hiccup — as opposed to a definite "no" (a 404 for the well-known document, a
+ * non-Aurboda body, a private address we refuse). Only definite answers are
+ * worth remembering for an hour; a transient one must be retried (#1094).
  */
-export const isTransientFetchError = (error: unknown): boolean =>
-  isAxiosError(error) && (error.response == null || error.response.status >= 500)
+export const isTransientFetchError = (error: unknown): boolean => {
+  if (isAxiosError(error)) {
+    const status = error.response?.status
+    return status === undefined || status >= 500 || status === 429 || status === 403
+  }
+  if (error instanceof SafeFetchError) return error.code === 'dns'
+  const code = systemErrorCode(error)
+  if (code !== undefined) return TRANSIENT_NETWORK_CODES.has(code)
+  return error instanceof Error && /timed out|timeout/i.test(error.message)
+}
 
 /** Probe `<base>/.well-known/aurboda`, folding definite negatives into a value. */
 export const probeInstance = async (base: string): Promise<InstanceProbe> => {
@@ -105,6 +135,11 @@ export type ApiBaseResolver = (base: string) => Promise<string | null>
  * A per-instance memo of the well-known probe: an Aurboda host's API base, or
  * null for any other server. Both answers are kept for [ttlMs]; a transient
  * failure is not remembered (and rethrown) so the peer is retried next time.
+ *
+ * The in-flight promise is memoised too: followees are walked concurrently, so
+ * without it every followee on one instance would fire its own probe on a cold
+ * round (#1098). A rejected probe drops out of the map, leaving the next call
+ * to retry.
  */
 export const createApiBaseResolver = (
   probe: (base: string) => Promise<InstanceProbe> = probeInstance,
@@ -112,13 +147,23 @@ export const createApiBaseResolver = (
   now: () => number = Date.now,
 ): ApiBaseResolver => {
   const cache = new Map<string, { apiBase: string | null; expiresAt: number }>()
+  const inFlight = new Map<string, Promise<string | null>>()
   return async (base) => {
     const hit = cache.get(base)
     if (hit && hit.expiresAt > now()) return hit.apiBase
-    const outcome = await probe(base)
-    const apiBase = outcome.kind === 'aurboda' ? trimSlashes(outcome.api_base) : null
-    cache.set(base, { apiBase, expiresAt: now() + ttlMs })
-    return apiBase
+    const pending = inFlight.get(base)
+    if (pending) return pending
+    const request = probe(base)
+      .then((outcome) => {
+        const apiBase = outcome.kind === 'aurboda' ? trimSlashes(outcome.api_base) : null
+        cache.set(base, { apiBase, expiresAt: now() + ttlMs })
+        return apiBase
+      })
+      .finally(() => {
+        inFlight.delete(base)
+      })
+    inFlight.set(base, request)
+    return request
   }
 }
 
@@ -142,6 +187,8 @@ export interface ChallengeDiscoveryDeps {
   listFollowing: (user: string) => Promise<FeedFollowingRecord[]>
   listHosted: (user: string) => Promise<ChallengeRecord[]>
   listParticipations: (user: string) => Promise<ChallengeParticipationRecord[]>
+  /** Canonical URLs of challenges the user left (the leave tombstones). */
+  listLeft: (user: string) => Promise<string[]>
   /** Public challenges of a user on THIS instance — no HTTP round trip. */
   listLocalPublic: (username: string) => Promise<ChallengeRecord[]>
   resolveApiBase: ApiBaseResolver
@@ -152,7 +199,7 @@ export interface ChallengeDiscoveryDeps {
 
 export interface ChallengeDiscoveryResult {
   challenges: DiscoveredChallenge[]
-  /** Followed Aurboda instances that did not answer this round. */
+  /** Followed *instances* that did not answer this round — one dead host counts once. */
   peers_unreachable: number
 }
 
@@ -242,16 +289,20 @@ export const createChallengeDiscovery =
   (deps: ChallengeDiscoveryDeps): DiscoverChallenges =>
   async (user) => {
     const now = (deps.now ?? (() => new Date()))()
-    const [following, hosted, participations] = await Promise.all([
+    const [following, hosted, participations, left] = await Promise.all([
       deps.listFollowing(user),
       deps.listHosted(user),
       deps.listParticipations(user),
+      deps.listLeft(user),
     ])
     // Everything the user already has a row for — hosted, joined, or left
-    // (leaving was a choice; the widget/page shouldn't nag) — is never suggested.
+    // (leaving was a choice; the widget/page shouldn't nag) — is never
+    // suggested. Compared canonically, so a challenge joined by a link with a
+    // query string still matches what its host lists.
     const mine = new Set([
-      ...hosted.map((c) => trimSlashes(buildShareUrl(deps.webHost, user, c.slug))),
-      ...participations.map((p) => trimSlashes(p.challenge_url)),
+      ...hosted.map((c) => canonical(buildShareUrl(deps.webHost, user, c.slug))),
+      ...participations.map((p) => canonical(p.challenge_url)),
+      ...left.map((url) => canonical(url)),
     ])
 
     const peers = following.flatMap((followee) => {
@@ -274,20 +325,22 @@ export const createChallengeDiscovery =
       },
     )
 
-    let peersUnreachable = 0
+    // Counted per instance, not per followee: three followees on one dead host
+    // is one instance the user couldn't be shown (#1092).
+    const unreachableBases = new Set<string>()
     const found: DiscoveredChallenge[] = []
     for (const { followee, items, parsed } of listings) {
       if (items === undefined) {
-        peersUnreachable += 1
+        unreachableBases.add(parsed.base)
         continue
       }
       if (items === null) continue
       for (const item of items) {
         const discovered = toDiscovered(item, followee, parsed, now)
-        if (discovered && !mine.has(trimSlashes(discovered.share_url))) found.push(discovered)
+        if (discovered && !mine.has(canonical(discovered.share_url))) found.push(discovered)
       }
     }
-    return { challenges: sortDiscovered(found), peers_unreachable: peersUnreachable }
+    return { challenges: sortDiscovered(found), peers_unreachable: unreachableBases.size }
   }
 
 /** The production wiring: real DB reads, SSRF-guarded peer fetches, a memoised well-known probe. */
@@ -300,6 +353,7 @@ export const defaultChallengeDiscoveryDeps = (webHost: string): ChallengeDiscove
   },
   listFollowing: listAcceptedFeedFollowing,
   listHosted: listChallenges,
+  listLeft: listLeftChallengeUrls,
   listLocalPublic: listPublicChallenges,
   listParticipations: listChallengeParticipations,
   resolveApiBase: createApiBaseResolver(),

@@ -491,7 +491,12 @@ export const createChallengeParticipation = async (
   const dataToken = randomToken(24)
   const result = await query<ParticipationRow>(
     user,
-    `INSERT INTO challenge_participations
+    // Joining clears any leave-tombstone for the same URL, so leave → rejoin →
+    // leave works and the second leave suppresses it again (#1093).
+    `WITH cleared AS (
+       DELETE FROM challenge_left WHERE challenge_url = $1
+     )
+     INSERT INTO challenge_participations
        (challenge_url, host_identity, name, source_type, pattern, activity_type_id, aggregation, unit, bucket_size, start_ts, end_ts, timezone, data_token)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
      RETURNING ${PARTICIPATION_COLUMNS}`,
@@ -558,7 +563,42 @@ export const getParticipationByUrl = async (
   return result.rows.length ? mapParticipation(result.rows[0]) : null
 }
 
-export const deleteChallengeParticipation = async (user: string, id: string): Promise<boolean> => {
-  const result = await query(user, `DELETE FROM challenge_participations WHERE id = $1`, [id])
-  return (result.rowCount ?? 0) > 0
+/**
+ * Leave a challenge: the participation row is hard-deleted and the challenge
+ * URL kept as a tombstone in `challenge_left`, so discovery never suggests
+ * again what the user deliberately walked away from (#1093). Written inside the
+ * delete statement, the way `deleteFeedPost` records an auto-share suppression.
+ *
+ * Pass `tombstone: false` for a delete that is *not* a leave — the rollback of
+ * a join the host rejected — which must leave the challenge discoverable.
+ */
+export const deleteChallengeParticipation = async (
+  user: string,
+  id: string,
+  options: { tombstone?: boolean } = {},
+): Promise<boolean> => {
+  if (options.tombstone === false) {
+    const result = await query(user, `DELETE FROM challenge_participations WHERE id = $1`, [id])
+    return (result.rowCount ?? 0) > 0
+  }
+  const result = await query<{ id: string }>(
+    user,
+    `WITH deleted AS (
+       DELETE FROM challenge_participations WHERE id = $1
+       RETURNING id, challenge_url
+     ), tomb AS (
+       INSERT INTO challenge_left (challenge_url)
+       SELECT challenge_url FROM deleted
+       ON CONFLICT (challenge_url) DO NOTHING
+     )
+     SELECT id FROM deleted`,
+    [id],
+  )
+  return result.rows.length > 0
+}
+
+/** Challenge URLs the user has left — discovery's "don't suggest this again" set. */
+export const listLeftChallengeUrls = async (user: string): Promise<string[]> => {
+  const result = await query<{ challenge_url: string }>(user, `SELECT challenge_url FROM challenge_left`)
+  return result.rows.map((row) => row.challenge_url)
 }
