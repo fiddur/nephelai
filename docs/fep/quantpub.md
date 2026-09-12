@@ -96,12 +96,15 @@ interpreted as described in [RFC-2119].
   detecting QuantPub-capable origins (§7), and enriching received posts with
   their structured payloads.
 
-Naming follows the two conventions of the layers involved. **JSON-LD extension
-terms** (the `quant:` properties on AS2 objects) use lowerCamelCase, matching
-ActivityStreams' own vocabulary, and this proposal **reuses AS2 properties
-where they exist** (`startTime`, `endTime`) instead of minting parallel terms.
-**HTTP payload fields and metric keys** (§4–§6, §2.1) use snake_case — they are
-plain JSON contracts, not JSON-LD. All timestamps are ISO 8601 with timezone.
+Naming is lowerCamelCase throughout. **JSON-LD extension terms** (the
+`quant:` properties on AS2 objects) match ActivityStreams' own vocabulary,
+and this proposal **reuses AS2 properties where they exist** (`startTime`,
+`endTime`) instead of minting parallel terms. **HTTP payload fields and
+metric keys** (§4–§6, §2.1) use the same lowerCamelCase — the payload layer
+is a plain JSON contract, not JSON-LD, but one casing across both layers
+matches AS2 and FitPub's established formats and means a post's `startTime`
+and its payload's `startTime` are literally the same name. All timestamps are
+ISO 8601 with timezone.
 The JSON-LD namespace for the `quant:` prefix is `https://w3id.org/quantpub#`
 (final IRI to be settled with the FEP number).
 
@@ -145,7 +148,7 @@ derivable from the window, and when the author chooses to share it as a stat
 it appears in `quant:metrics` as the `duration` key (in seconds). AS2's
 `duration` (`xsd:duration`) MAY be set additionally for plain-AS2 consumers.
 (The §5 payload layer — plain JSON, not JSON-LD — still exposes a
-`duration_seconds` convenience field.)
+`durationSeconds` convenience field.)
 
 The `published` property carries the *share* time (timeline ordering); the
 workout time lives in `startTime` — a workout shared a week later MUST NOT be
@@ -156,13 +159,13 @@ back-dated in followers' timelines.
 Each entry of `quant:metrics` is:
 
 ```json
-{ "key": "heart_rate_avg", "value": 152, "unit": "bpm" }
+{ "key": "heartRateAvg", "value": 152, "unit": "bpm" }
 ```
 
-- `key` (REQUIRED): a snake_case machine key. This spec RECOMMENDS the common
-  keys `duration`, `distance`, `heart_rate_avg`, `heart_rate_max`,
-  `hr_zone_minutes`, `calories`, `steps`, `elevation_gain`, `pace_avg`,
-  `stress_avg`; implementations MAY add their own keys.
+- `key` (REQUIRED): a lowerCamelCase machine key. This spec RECOMMENDS the common
+  keys `duration`, `distance`, `heartRateAvg`, `heartRateMax`,
+  `hrZoneMinutes`, `calories`, `steps`, `elevationGain`, `paceAvg`,
+  `stressAvg`; implementations MAY add their own keys.
 - `value` (REQUIRED): a number, or a small keyed record of numbers (e.g.
   HR-zone minutes `{ "z2": 22, "z3": 10 }`).
 - `unit` (OPTIONAL): a unit string for the scalar form (`bpm`, `km`,
@@ -186,7 +189,7 @@ allowance as §2) and carries the same properties as §2 except
 | `quant:observationOf` | string | The domain observed, e.g. `sleep`, `daily`, `mood` |
 
 The `quant:metrics` array carries the observed values with the same
-`key`/`value`/`unit` shape (e.g. `sleep_duration`, `sleep_score`, `hrv_avg`,
+`key`/`value`/`unit` shape (e.g. `sleepDuration`, `sleepScore`, `hrvAvg`,
 `steps`, `mood`). An exercise is conceptually an observation with an activity
 type; implementations MAY treat `quant:Exercise` as a specialisation of
 `quant:Observation`.
@@ -204,13 +207,13 @@ GET /.well-known/quantpub
   "product": "my-qs-tool",
   "version": "1.0.0",
   "quantpub": "0.1",
-  "api_base": "https://qs.example.net/api"
+  "apiBase": "https://qs.example.net/api"
 }
 ```
 
 - `product` / `version`: free-form implementation identity.
 - `quantpub`: the spec version implemented.
-- `api_base`: the absolute base URL under which the §5/§6 endpoints live.
+- `apiBase`: the absolute base URL under which the §5/§6 endpoints live.
 
 This lets a peer verify a host speaks QuantPub and locate its API with one
 cacheable request (responses SHOULD be cacheable, e.g. `max-age=3600`). It
@@ -223,7 +226,7 @@ must be tiny and unambiguous.
 For every shared post, the origin MUST serve a machine-readable payload at:
 
 ```
-GET {api_base}/public/{username}/feed/{post_id}
+GET {apiBase}/public/{username}/feed/{postId}
 ```
 
 returning a JSON object discriminated on `kind`. For an exercise/observation
@@ -232,20 +235,20 @@ share, `kind: "activity"`:
 ```json
 {
   "kind": "activity",
-  "activity_type": "running",
+  "activityType": "running",
   "title": "Morning run",
-  "start_time": "2026-08-15T06:30:00+02:00",
-  "end_time": "2026-08-15T07:09:00+02:00",
-  "duration_seconds": 2340,
+  "startTime": "2026-08-15T06:30:00+02:00",
+  "endTime": "2026-08-15T07:09:00+02:00",
+  "durationSeconds": 2340,
   "metrics": [
     { "key": "duration", "value": 2340, "unit": "seconds" },
     { "key": "distance", "value": 8.2, "unit": "km" },
-    { "key": "heart_rate_avg", "value": 152, "unit": "bpm" },
-    { "key": "hr_zone_minutes", "value": { "z2": 22, "z3": 10 } }
+    { "key": "heartRateAvg", "value": 152, "unit": "bpm" },
+    { "key": "hrZoneMinutes", "value": { "z2": 22, "z3": 10 } }
   ],
   "series": [
     {
-      "metric": "heart_rate",
+      "metric": "heartRate",
       "unit": "bpm",
       "bucket": "5s",
       "samples": [
@@ -274,9 +277,9 @@ share, `kind: "activity"`:
   be present only when the author chose to share the route — in Aurboda, by
   attaching the rendered route-map image, so the machine-readable track has
   exactly the same audience as the picture of it. This shape is used instead
-  of a GeoJSON `LineString` (despite §1's preference for existing vocabulary)
-  because GeoJSON coordinate arrays carry no per-point time; the timestamps
-  are what let a consumer sync the route to the series chart. They also
+  of a GeoJSON `LineString` because GeoJSON coordinate arrays carry no
+  per-point time; the timestamps are what let a consumer sync the route to
+  the series chart. They also
   expose position-at-time, and thus pace, to machine consumers — a client
   offering route sharing SHOULD say so.
 - Implementations MAY define further `kind`s (Aurboda adds
@@ -294,7 +297,7 @@ High-resolution series MUST NOT be embedded in federated objects. They are
 served from one public, read-only endpoint:
 
 ```
-GET {api_base}/public/{username}/series?metric={key}&start={iso}&end={iso}&bucket={5s|60s|...}
+GET {apiBase}/public/{username}/series?metric={key}&start={iso}&end={iso}&bucket={5s|60s|...}
 ```
 
 A request resolves **only when all of the following hold** — this data-driven
@@ -321,7 +324,7 @@ that never existed. When the request resolves:
 
 ```json
 {
-  "metric": "heart_rate",
+  "metric": "heartRate",
   "unit": "bpm",
   "bucket": "5s",
   "samples": [
@@ -347,9 +350,9 @@ baseline, since typed AS2 frameworks on the *consuming* side may drop unknown
 in-band properties before application code sees them:
 
 - **Object-id convention (normative baseline).** A Level 2 publisher SHOULD
-  mint post object ids as `{web_base}/users/{username}/feed/{post_id}`. A
+  mint post object ids as `{webBase}/users/{username}/feed/{postId}`. A
   consumer that matches this shape resolves the payload at
-  `{api_base}/public/{username}/feed/{post_id}`, with `{api_base}` taken from
+  `{apiBase}/public/{username}/feed/{postId}`, with `{apiBase}` taken from
   the origin's discovery document (§4).
 - **`quant:structuredUrl` (in-band override).** A publisher whose URL layout
   differs MAY state the payload URL explicitly on the object. A consumer MUST
@@ -363,7 +366,7 @@ On ingesting a `Create`/`Update` for a `Note`, a receiving peer:
    does, avoiding needless requests);
 2. resolves the payload URL: a same-host `quant:structuredUrl` names it
    directly, so no discovery fetch is needed to *locate* it; the id
-   convention instead requires `{api_base}`, taken from
+   convention instead requires `{apiBase}`, taken from
    `/.well-known/quantpub` on the object's origin host (cacheable). A
    consumer MAY still fetch the discovery document in the
    `quant:structuredUrl` case as a capability check on the origin, but MUST
@@ -376,29 +379,10 @@ Enrichment MUST be best-effort and additive: any failure (non-QuantPub host,
 SSRF-guarded (public hosts only, no redirect following, size- and
 time-bounded); see Security considerations.
 
-#### 7.1 Coexistence and incremental adoption
-
-Every part of this proposal is additive, so an implementation with an
-established federation format can adopt it without breaking federation with
-its own older versions:
-
-- The discovery document (§4) and the §5/§6 endpoints are **new routes**; an
-  existing vendor detail endpoint keeps serving unchanged alongside them.
-- The `quant:*` properties and `quant:structuredUrl` ride alongside any
-  existing vendor extension on the same `Note` (e.g. FitPub's
-  `fitpub:detailUri`); consumers ignore properties they don't know, so old
-  peers see exactly the object they saw before.
-- Dual-typing is RECOMMENDED but not required (§2), because array-valued
-  `type` is the one addition known to break some deployed consumers; a
-  publisher whose install base predates array-type tolerance SHOULD start
-  single-typed and add the second type once its consumers tolerate arrays.
-- Nothing in §7 requires the *object id* to change: a publisher keeping its
-  existing id layout uses `quant:structuredUrl` instead of the id convention.
-
 ### 8. Privacy model (normative)
 
 1. **Scalars never imply series.** Sharing a scalar summary (e.g.
-   `heart_rate_avg`) MUST NOT expose the underlying series. A per-sample trace
+   `heartRateAvg`) MUST NOT expose the underlying series. A per-sample trace
    is far more revealing than an average.
 2. **Series are a separate, explicit opt-in**, made per post, per metric. The
    default for any share MUST be: no series.
@@ -413,13 +397,15 @@ its own older versions:
    followers-only one). Only the discovery document (§4) is cacheable.
 5. **Bounded resolution.** The server-side bucket floor (§6) is a privacy
    floor, not only a payload bound: implementations MUST NOT serve raw
-   per-measurement *series* timestamps on public endpoints. (The one
-   deliberate exception is the §5 `route`'s per-fix `t`, which is its own
-   separately-opted-in geography share — item 6.)
+   per-measurement *series* timestamps on public endpoints. (The §5 `route`'s
+   per-fix `t` is not a series timestamp and is outside this rule's scope; it
+   is governed by item 6.)
 6. **Geography is its own explicit opt-in.** A GPS route MUST NOT be exposed
    by any scalar or series share; the default for any share MUST be: no
-   route. Publishers SHOULD downsample and SHOULD apply privacy geo-masking
-   (home-zone trimming) before export, not only in rendering.
+   route. Publishers SHOULD bound route resolution the way §6's bucket floor
+   bounds series resolution — RECOMMENDED: at most 500 points per route (or
+   an equivalent minimum inter-point spacing) — and SHOULD apply privacy
+   geo-masking (home-zone trimming) before export, not only in rendering.
 
 ### 9. Capability tokens for follower-scoped payloads
 
@@ -471,13 +457,32 @@ replace capability tokens (which remain the only channel that works without
 ActivityPub key material on either side), and a request that satisfies
 neither channel still returns 404, never 403 (§8.3).
 
+### 10. Coexistence and incremental adoption
+
+Every part of this proposal is additive, so an implementation with an
+established federation format can adopt it without breaking federation with
+its own older versions:
+
+- The discovery document (§4) and the §5/§6 endpoints are **new routes**; an
+  existing vendor detail endpoint keeps serving unchanged alongside them.
+- The `quant:*` properties and `quant:structuredUrl` ride alongside any
+  existing vendor extension on the same `Note` (e.g. FitPub's
+  `fitpub:detailUri`); consumers ignore properties they don't know, so old
+  peers see exactly the object they saw before.
+- Dual-typing is RECOMMENDED but not required (§2), because array-valued
+  `type` is the one addition known to break some deployed consumers; a
+  publisher whose install base predates array-type tolerance SHOULD start
+  single-typed and add the second type once its consumers tolerate arrays.
+- Nothing in §7 requires the *object id* to change: a publisher keeping its
+  existing id layout uses `quant:structuredUrl` instead of the id convention.
+
 ## Implementing this in a weekend
 
 A home-built QS tool becomes a **Level 1 publisher** with two-and-a-half
 routes and no ActivityPub stack:
 
 1. Serve `/.well-known/quantpub` (static JSON, §4).
-2. Serve `GET /public/{you}/feed/{post_id}` for each thing you choose to
+2. Serve `GET /public/{you}/feed/{postId}` for each thing you choose to
    publish (§5) — for a single-user tool this can be near-static JSON.
 3. Optionally serve the series endpoint (§6) for the series you explicitly
    share, with the four-condition check and 404 fallback.
@@ -522,14 +527,14 @@ structured channel already in place.
     "quant:metrics": [
       { "key": "duration", "value": 2340, "unit": "seconds" },
       { "key": "distance", "value": 8.2, "unit": "km" },
-      { "key": "heart_rate_avg", "value": 152, "unit": "bpm" },
-      { "key": "hr_zone_minutes", "value": { "z2": 22, "z3": 10 } }
+      { "key": "heartRateAvg", "value": 152, "unit": "bpm" },
+      { "key": "hrZoneMinutes", "value": { "z2": 22, "z3": 10 } }
     ],
     "quant:series": [
       {
-        "metric": "heart_rate",
+        "metric": "heartRate",
         "mediaType": "application/json",
-        "href": "https://qs.example.net/api/public/freja/series?metric=heart_rate&start=2026-08-15T06%3A30%3A00%2B02%3A00&end=2026-08-15T07%3A09%3A00%2B02%3A00&bucket=5s"
+        "href": "https://qs.example.net/api/public/freja/series?metric=heartRate&start=2026-08-15T06%3A30%3A00%2B02%3A00&end=2026-08-15T07%3A09%3A00%2B02%3A00&bucket=5s"
       }
     ]
   }
@@ -553,9 +558,9 @@ once the final context IRI is settled, referencing it alone suffices.
   "startTime": "2026-08-14T23:05:00+02:00",
   "endTime": "2026-08-15T06:45:00+02:00",
   "quant:metrics": [
-    { "key": "sleep_duration", "value": 27600, "unit": "seconds" },
-    { "key": "hrv_avg", "value": 64, "unit": "ms" },
-    { "key": "sleep_score", "value": 86 }
+    { "key": "sleepDuration", "value": 27600, "unit": "seconds" },
+    { "key": "hrvAvg", "value": 64, "unit": "ms" },
+    { "key": "sleepScore", "value": 86 }
   ]
 }
 ```
@@ -563,10 +568,10 @@ once the final context IRI is settled, referencing it alone suffices.
 ### Series requests and the 404 boundary
 
 ```
-GET /api/public/freja/series?metric=heart_rate&start=2026-08-15T06:30:00%2B02:00&end=2026-08-15T07:09:00%2B02:00&bucket=60s
+GET /api/public/freja/series?metric=heartRate&start=2026-08-15T06:30:00%2B02:00&end=2026-08-15T07:09:00%2B02:00&bucket=60s
 → 200, bucketed samples (shared as a series on a public post, window covered)
 
-GET /api/public/freja/series?metric=heart_rate&start=2026-08-14T00:00:00Z&end=2026-08-16T00:00:00Z&bucket=60s
+GET /api/public/freja/series?metric=heartRate&start=2026-08-14T00:00:00Z&end=2026-08-16T00:00:00Z&bucket=60s
 → 404 (window not covered by any shared activity — the share can't be widened)
 
 GET /api/public/freja/series?metric=stress&start=...&end=...&bucket=60s
@@ -602,7 +607,7 @@ GET /api/public/freja/series?metric=stress&start=...&end=...&bucket=60s
 
 - **[FitPub](https://fitpub.social/)** — federated fitness tracking
   (Java/Spring, multi-instance) whose wire format is this proposal's closest
-  relative and directly informed §7.1 and the §9 signed-fetch grant. FitPub
+  relative and directly informed §10 and the §9 signed-fetch grant. FitPub
   delivers a plain `Note` (HTML content, one-line stat summary, generated
   map-image attachment) with AS2 `startTime`/`endTime` and an in-band pointer
   `fitpub: { "detailUri": … }` (namespace `https://fitpub.social/ns#`) to an
@@ -615,7 +620,7 @@ GET /api/public/freja/series?metric=stress&start=...&end=...&bucket=60s
   are authorized by signed `GET`s (adopted here as the optional §9 grant)
   rather than capability tokens; non-public objects answer `403` rather than
   this proposal's normative `404` (§8.3); and it consumes only scalars and
-  track geometry — no series concept. §7.1 describes how such an
+  track geometry — no series concept. §10 describes how such an
   implementation adopts QuantPub without breaking federation with its own
   older versions. (Format read from the [FitPub
   source](https://codeberg.org/fitpub/fitpub) as of 2026-08-21:
@@ -660,7 +665,11 @@ GET /api/public/freja/series?metric=stress&start=...&end=...&bucket=60s
   delivered `Note`'s id is the resolvable post URL, with the `Create` as a
   `#create` fragment. (Remaining vendor-prefixed surface: the
   `/.well-known/aurboda` document backs Aurboda-specific challenge
-  federation, alongside — not instead of — `/.well-known/quantpub`.)
+  federation, alongside — not instead of — `/.well-known/quantpub`.) Aurboda's
+  payload field naming predates this document's lowerCamelCase alignment — it
+  currently serves the earlier snake_case forms (`start_time`, `api_base`,
+  `heart_rate_avg`, …) — and will be updated once the naming settles in
+  review.
 
 ## Copyright
 
